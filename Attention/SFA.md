@@ -10,7 +10,7 @@
 
 ### 计算公式解析
 
-### DeepSeek\-V3 MLA 计算公式整理
+### DeepSeek-V3 MLA 计算公式整理
 
 #### 1. 符号说明
 
@@ -20,27 +20,47 @@
 | $d$   | 嵌入维度                   | $d_c, d'_c$     | KV 与 Query 压缩维度                     |
 | $d_h$ | 单头维度                   | $d_h^R$         | RoPE 维度                                |
 | $W$   | 投影矩阵                   | $[\cdot;\cdot]$ | 向量拼接                                 |
-| $c$   | 压缩后的潜向量             | $C, R$          | 内容 \(Content\) 与 旋转 \(Rotary\) 部分 |
+| $c$   | 压缩后的潜向量             | $C, R$          | 内容 (Content) 与 旋转 (Rotary) 部分 |
 
 ***
 
-#### 2. KV 生成与压缩 \(Key\-Value Generation\)
+#### 2. KV 生成与压缩 (Key-Value Generation)
 
 仅缓存 $c_t^{KV}$ 和 $k_t^R$ 以节省显存。
 
-$$ \begin{aligned} c_t^{KV} &= W_{DKV} h_t & \quad & \text{(KV 压缩)} \\ [k_{t,1}^C; \dots; k_{t,n_h}^C] = k_t^C &= W_{UK} c_t^{KV} & \quad & \text{(内容 Key 解压缩)} \\ k_t^R &= \text{RoPE}(W_{KR} h_t) & \quad & \text{(旋转 Key，多头共享)} \\ k_{t,i} &= [k_{t,i}^C; k_t^R] & \quad & \text{(完整 Key)} \\ [v_{t,1}^C; \dots; v_{t,n_h}^C] = v_t^C &= W_{UV} c_t^{KV} & \quad & \text{(Value 解压缩)} \end{aligned}  $$
+$$
+\begin{aligned}
+c_t^{KV} &= W_{DKV} h_t & \quad & \text{(KV 压缩)} \\
+{[}k_{t,1}^C; \dots; k_{t,n_h}^C{]} = k_t^C &= W_{UK} c_t^{KV} & \quad & \text{(内容 Key 解压缩)} \\
+k_t^R &= \text{RoPE}(W_{KR} h_t) & \quad & \text{(旋转 Key，多头共享)} \\
+k_{t,i} &= {[}k_{t,i}^C; k_t^R{]} & \quad & \text{(完整 Key)} \\
+{[}v_{t,1}^C; \dots; v_{t,n_h}^C{]} = v_t^C &= W_{UV} c_t^{KV} & \quad & \text{(Value 解压缩)}
+\end{aligned}
+$$
 
 ***
 
-#### 3. Query 生成与压缩 \(Query Generation\)
+#### 3. Query 生成与压缩 (Query Generation)
 
-$$ \begin{aligned} c_t^Q &= W_{DQ} h_t & \quad & \text{(Query 压缩)} \\ [q_{t,1}^C; \dots; q_{t,n_h}^C] = q_t^C &= W_{UQ} c_t^Q & \quad & \text{(内容 Query 解压缩)} \\ [q_{t,1}^R; \dots; q_{t,n_h}^R] = q_t^R &= \text{RoPE}(W_{QR} c_t^Q) & \quad & \text{(旋转 Query，分头计算)} \\ q_{t,i} &= [q_{t,i}^C; q_{t,i}^R] & \quad & \text{(完整 Query)} \end{aligned}  $$
+$$
+\begin{aligned}
+c_t^Q &= W_{DQ} h_t & \quad & \text{(Query 压缩)} \\
+{[}q_{t,1}^C; \dots; q_{t,n_h}^C{]} = q_t^C &= W_{UQ} c_t^Q & \quad & \text{(内容 Query 解压缩)} \\
+{[}q_{t,1}^R; \dots; q_{t,n_h}^R{]} = q_t^R &= \text{RoPE}(W_{QR} c_t^Q) & \quad & \text{(旋转 Query，分头计算)} \\
+q_{t,i} &= {[}q_{t,i}^C; q_{t,i}^R{]} & \quad & \text{(完整 Query)}
+\end{aligned}
+$$
 
 ***
 
-#### 4. 注意力计算 \(Attention Calculation\)
+#### 4. 注意力计算 (Attention Calculation)
 
-$$ \begin{aligned} o_{t,i} &= \sum_{j=1}^{t} \text{Softmax}_j \left( \frac{q_{t,i}^\top k_{j,i}}{\sqrt{d_h + d_h^R}} \right) v_{j,i}^C & \quad & \text{(单头注意力输出)} \\ u_t &= W_O [o_{t,1}; \dots; o_{t,n_h}] & \quad & \text{(最终输出投影)} \end{aligned}  $$
+$$
+\begin{aligned}
+o_{t,i} &= \sum_{j=1}^{t} \text{Softmax}_j \big( \frac{q_{t,i}^\top k_{j,i}}{\sqrt{d_h + d_h^R}} \big) v_{j,i}^C & \quad & \text{(单头注意力输出)} \\
+u_t &= W_O {[}o_{t,1}; \dots; o_{t,n_h}{]} & \quad & \text{(最终输出投影)}
+\end{aligned}
+$$
 
 #### 计算图
 
@@ -55,7 +75,7 @@ $$ \begin{aligned} o_{t,i} &= \sum_{j=1}^{t} \text{Softmax}_j \left( \frac{q_{t,
 
 ![](../assets/sfa-mqa.png)
 
-## MindIE\-LLM实现
+## MindIE-LLM实现
 
 > 待补充
 
@@ -83,11 +103,15 @@ $$ \begin{aligned} o_{t,i} &= \sum_{j=1}^{t} \text{Softmax}_j \left( \frac{q_{t,
 
 ***
 
-#### 2. 索引分数计算 \(Index Score Calculation\)
+#### 2. 索引分数计算 (Index Score Calculation)
 
 计算当前 token $t$ 与历史 token $s$ 之间的相关性分数。
 
-$$ \begin{aligned} I_{t,s} &= \sum_{j=1}^{H_I} w_{t,j}^I \cdot \text{ReLU} \left( q_{t,j}^I \cdot k_s^I \right) \end{aligned}  $$
+$$
+\begin{aligned}
+I_{t,s} &= \sum_{j=1}^{H_I} w_{t,j}^I \cdot \text{ReLU}( q_{t,j}^I \cdot k_s^I )
+\end{aligned}
+$$
 
 * $q_{t,j}^I, w_{t,j}^I$ 源自 $h_t$；$k_s^I$ 源自 $h_s$。
 
@@ -95,11 +119,16 @@ $$ \begin{aligned} I_{t,s} &= \sum_{j=1}^{H_I} w_{t,j}^I \cdot \text{ReLU} \left
 
 ***
 
-#### 3. 稀疏选择与注意力 \(Sparse Selection &amp; Attention\)
+#### 3. 稀疏选择与注意力 (Sparse Selection & Attention)
 
-根据索引分数筛选 Top\-k 个 KV 条目进行注意力计算。
+根据索引分数筛选 Top-k 个 KV 条目进行注意力计算。
 
-$$ \begin{aligned} \mathcal{S}_t &= \left\{ s \mid I_{t,s} \in \text{Top-k}(I_{t,:}) \right\} & \quad & \text{(选中 token 集合)} \\ u_t &= \text{Attn} \left( h_t, \left\{ c_s \mid s \in \mathcal{S}_t \right\} \right) & \quad & \text{(稀疏注意力输出)} \end{aligned}  $$
+$$
+\begin{aligned}
+\mathcal{S}_t &= \{ s \mid I_{t,s} \in \text{Top-k}(I_{t,:}) \} & \quad & \text{(选中 token 集合)} \\
+u_t &= \text{Attn}( h_t, \{ c_s \mid s \in \mathcal{S}_t \} ) & \quad & \text{(稀疏注意力输出)}
+\end{aligned}
+$$
 
 * 仅对索引分数最高的 $k$ 个历史 token 对应的 $c_s$ 进行注意力运算。
 
@@ -109,7 +138,7 @@ $$ \begin{aligned} \mathcal{S}_t &= \left\{ s \mid I_{t,s} \in \text{Top-k}(I_{t
 
 ![](../assets/sfa-mqa.png)
 
-## MindIE\-LLM实现
+## MindIE-LLM实现
 
 > dsv32实现只有吸收版本
 
@@ -367,7 +396,7 @@ def apply_decode_sfa(
     return self.sfa_postprocess(output)
 ```
 
-## vLLM + vLLM\-Ascend 方案
+## vLLM + vLLM-Ascend 方案
 
 > 代码路径：`vllm_ascend/attention/sfa_v1.py`
 > 仅实现吸收（MQA）版本，运行在华为昇腾NPU上
