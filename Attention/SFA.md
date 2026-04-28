@@ -612,3 +612,337 @@ def _execute_sparse_flash_attention_process(self, ql_nope, q_pe, kv_cache, topk_
 attn_output = self._v_up_proj(attn_output)  # bmm(attn_output, W_UV)
 output[...] = self.o_proj(attn_output)[0]
 ```
+
+## SGLang 方案
+
+> 代码路径：`sglang/python/sglang/srt/layers/attention/nsa/nsa_indexer.py` (Indexer)
+> `sglang/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py` (Sparse Attention)
+> `sglang/python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py` (DSA Prepare/Core)
+> 仅实现吸收（MQA）版本，运行在华为昇腾NPU上
+
+### 路由与分发
+
+SGLang 将 DeepSeek V3.2 / GLM5 的注意力分为三条路径，通过 `AttentionBackendRegistry` 自动选择：
+
+| 方法 | 条件 | 使用场景 |
+|------|------|----------|
+| `MHA_NPU` | Ascend后端 + 无 indexer | 非NSA模型的Prefill |
+| `MLA_NPU` | Ascend后端 + 无 indexer | 非NSA模型的Decode |
+| **`DSA_NPU`** | Ascend后端 + 有 indexer | NSA模型 Prefill+Decode 统一入口 |
+
+```python
+# sglang/.../attention_backend_handler.py:38-53
+def handle_attention_ascend(attn, forward_batch):
+    # 关键判断：模型是否有 indexer 决定了走 DSA 还是普通 MLA
+    if hasattr(attn, "indexer"):
+        return AttnForwardMethod.DSA_NPU    # DeepSeekV3.2 / GLM5 → SFA路径
+    else:
+        return AttnForwardMethod.MHA_NPU if is_prefill else AttnForwardMethod.MLA_NPU
+```
+
+与 vLLM-Ascend 的 `AscendSFAImpl extends MLAAttentionImpl` 不同，SGLang 不做继承，而是独立出 `DSA_NPU` 路径，prepare 和 core 分阶段执行。
+
+### 整体架构
+
+```
+DeepseekV2AttentionMLA
+  ├── Indexer (MultiPlatformOp)          ← 跨平台 Indexer 抽象
+  │     ├── forward_npu()                ← NPU 路径
+  │     └── forward_cuda()               ← CUDA/HIP 路径 (FP8量化 + deep_gemm)
+  │
+  └── Dispatch (via AttentionBackendRegistry)
+        ├── forward_dsa_prepare_npu()    ← QKV投影 + 吸收 + Indexer
+        │     └── forward_dsa_core_npu() ← Sparse Attention + V解压缩 + O投影
+        ├── forward_mla_prepare_npu()    ← 非NSA MLA路径
+        └── forward_mha_prepare_npu()    ← 非NSA MHA路径
+```
+
+### 核心数据流
+
+```
+hidden_states
+    │
+    ├─[MLA投影]──────────────────────────────────────────┐
+    │  fused_qkv_a_proj_with_mqa → split q_lora / kv_no_split │
+    │                                                     │
+    ├─[Q路径]────────────────────────────────────────────┤
+    │  q_a_layernorm(q_lora)                              │
+    │  q_b_proj(q) → reshape [tokens, n_heads, qk_head_dim]│
+    │  split q_nope / q_pe                                │
+    │  bmm(q_nope.T, W_UK^T).T → q_nope_out (吸收: Q@W_UK)│
+    │                                                     │
+    ├─[KV路径]───────────────────────────────────────────┤
+    │  kv_a_layernorm(kv_no_split[..., :kv_lora_rank])    │
+    │  k_pe = kv_no_split[..., kv_lora_rank:]             │
+    │  RoPE(q_pe), RoPE(k_pe)                             │
+    │                                                     │
+    ├─[Indexer Q/K投影]──────────────────────────────────┤
+    │  wq_b(q_lora) → reshape [bs, H_I, d_I]              │
+    │  split q_pe/q_nope → npu_rotary_mul(q_pe) → cat    │
+    │                                                      │
+    │  wk(hidden_states) → k_norm → split k_pe/k_nope     │
+    │  npu_rotary_mul(k_pe) → unsqueeze(1) → cat          │
+    │  写入 index_k_cache (bf16, NPU路径不量化!)          │
+    │                                                      │
+    ├─[Indexer Weights]───────────────────────────────────┤
+    │  weights_proj(hidden_states) → [bs, H_I] 标量权重   │
+    │  [可选] 多流并行：weights与Q/K投影在不同stream上重叠│
+    │                                                      │
+    ├─[Lightning Indexer]─────────────────────────────────┤
+    │  npu_lightning_indexer(q_li, key_cache, weights,    │
+    │    sparse_count=2048, sparse_mode=3)                 │
+    │  → topk_indices [bs, topk]                           │
+    │                                                      │
+    ├─[Sparse Flash Attention]────────────────────────────┤
+    │  npu_sparse_flash_attention(                         │
+    │    query=q_nope_out (吸收后, kv_lora_rank维),        │
+    │    key=k_nope, value=k_nope,  (MQA吸收模式)          │
+    │    query_rope=q_pe, key_rope=k_pe,                  │
+    │    sparse_indices=topk_indices,                      │
+    │    sparse_mode=3, attention_mode=2)                  │
+    │  → attn_output [tokens, n_heads, kv_lora_rank]      │
+    │                                                      │
+    └─[后处理]───────────────────────────────────────────┘
+       bmm(attn_output, W_UV) → [tokens, n_heads, v_head_dim]
+       o_proj → output [tokens, hidden_size]
+```
+
+### 关键代码解析
+
+#### 1. Q/KV 投影与吸收 (MLA Prepare)
+
+> 对应公式：`c_t^Q = W_{DQ} h_t` → `W_{UQ} c_t^Q` → split `q_{t,i}^C` / `q_{t,i}^R`
+
+```python
+# deepseek_v2_attention_mla_npu.py :: forward_dsa_prepare_npu (Native路径, 非MLAPO)
+fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+# 对应公式: W_{DQ} h_t → c_t^Q,  W_{DKV} h_t → c_t^{KV},  W_{KR} h_t → k_t^R
+q, latent_cache = fused_qkv_a_proj_out.split(
+    [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+)
+q_lora = m.q_a_layernorm(q)                           # layernorm on c_t^Q
+k_nope, k_pe = latent_cache.unsqueeze(1).split(        # 拆分 KV 潜向量
+    [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+)
+k_nope = m.kv_a_layernorm(k_nope)                     # layernorm on c_t^{KV}
+q = m.q_b_proj(q_lora)[0]                              # W_{UQ} c_t^Q → [tokens, n_heads, qk_head_dim]
+q = q.view(-1, m.num_local_heads, m.qk_head_dim)
+
+q_nope, q_pe = q.split(                                # 拆分 Content / Rotary
+    [m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1
+)  # q_nope → q_{t,i}^C,  q_pe → q_{t,i}^R (RoPE前)
+
+# 吸收: q_nope @ W_UK^T → 将 Q 从 head_dim 映射到 kv_lora_rank
+# 对应 MQA 吸收模式: q_{t,i}^{C\top} W_{UK}^\top 提前计算, 使得 Attention 中
+# QK^\top = (q_nope @ W_UK^T) @ c_{KV}^\top 等效于原始 q_nope @ (W_UK @ c_{KV})^\top
+q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+q_nope_out = q_nope_out.transpose(0, 1)               # [tokens, n_heads, kv_lora_rank]
+```
+
+#### 2. Indexer Q/K 投影与 RoPE
+
+> 对应公式: `q_{t,j}^I` 源自 `h_t`, `k_s^I` 源自 `h_s`
+> 注意 Indexer K 是**单头的**（`unsqueeze(1)`），即 $H_I$ 头共享同一个 $k_s^I$
+
+```python
+# nsa_indexer.py :: forward_npu (neox_style 路径, DeepSeekV3.2使用)
+# ============ Indexer Q: q_{t,j}^I 计算 ============
+# wq_b 对应 q^I 投影, 输入是 q_lora (即 c_t^Q) 而非 hidden_states
+q = self.wq_b(q_lora)[0]                              # q_lora: [bs, 1536], q: [bs, 64*128]
+q = q.view(bs, self.n_heads, self.head_dim)           # [bs, H_I=64, d_I=128]
+q_pe, q_nope = torch.split(                            # split RoPE / nope
+    q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+)  # q_pe: [bs, 64, 64], q_nope: [bs, 64, 64]
+
+q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin)       # RoPE on q_{t,j}^{I,R}
+q_pe = q_pe.view(bs, self.n_heads, self.rope_head_dim)
+q = torch.cat([q_pe, q_nope], dim=-1)                 # q_{t,j}^I = [q_{t,j}^{I,R}; q_{t,j}^{I,C}]
+
+# ============ Indexer K: k_s^I 计算 ============
+# wk 对应 k^I 投影, 输入是 hidden_states (即 h_s)
+k_proj = self.wk(x)[0]                                # hidden_states: [bs, 7168] → [bs, 128]
+k = self.k_norm(k_proj)                               # LayerNorm on k_s^I
+k_pe, k_nope = torch.split(                            # split RoPE / nope
+    k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+)
+
+k_pe = k_pe.view(-1, 1, 1, self.rope_head_dim)
+k_pe = torch.ops.npu.npu_rotary_mul(k_pe, cos, sin)   # RoPE on k_s^{I,R}
+k_pe = k_pe.view(bs, 1, self.rope_head_dim)           # ★ 单头: [bs, 1, 64]
+k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)    # k_s^I: [bs, 1, 128]
+
+# 存入 Index K Cache (bf16, NPU路径不量化)
+# CUDA/HIP路径会走 Hadamard旋转 + FP8量化, 但 NPU 上直接存 bf16
+forward_batch.token_to_kv_pool.set_index_k_buffer(
+    layer_id, forward_batch.out_cache_loc, k
+)
+```
+
+#### 3. Indexer Weights 计算 (多流并行)
+
+> 对应公式: $w_{t,j}^I$ 源自 $h_t$
+
+```python
+# nsa_indexer.py :: forward_npu
+# weights_proj 对应 w^I 投影
+# [可选] 通过多流将 weights 计算与 Q/K 投影重叠, 隐藏延迟
+if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+    indexer_weight_stream = get_indexer_weight_stream()
+    indexer_weight_stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(indexer_weight_stream):
+        x = x.view(-1, self.hidden_size)
+        weights = self.weights_proj(x.float())[0].to(torch.bfloat16)  # [bs, H_I]
+        weights.record_stream(indexer_weight_stream)
+        weights_event = indexer_weight_stream.record_event()
+else:
+    x = x.view(-1, self.hidden_size)
+    weights = self.weights_proj(x.float())[0].to(torch.bfloat16)      # [bs, H_I]
+```
+
+#### 4. Lightning Indexer 调用
+
+> 对应公式:
+> $$I_{t,s} = \sum_{j=1}^{H_I} w_{t,j}^I \cdot \text{ReLU}(q_{t,j}^I \cdot k_s^I)$$
+> $$\mathcal{S}_t = \{ s \mid I_{t,s} \in \text{Top-k}(I_{t,:}) \}$$
+
+```python
+# nsa_indexer.py :: forward_npu
+# 从 cache 中读取所有历史 token 的 Indexer K
+past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
+
+topk_indices = torch_npu.npu_lightning_indexer(
+    query=q.view(-1, self.n_heads, self.head_dim),   # q_{t,j}^I: [tokens, H_I=64, d_I=128]
+    key=past_key_states,                               # k_s^I:   [total_tokens, 1, 128]
+    weights=weights,                                   # w_{t,j}^I: [tokens, H_I=64]
+    actual_seq_lengths_query=actual_seq_lengths_q,
+    actual_seq_lengths_key=actual_seq_lengths_kv,
+    block_table=block_table,
+    layout_query="TND",                                # tokens × n_heads × dim
+    layout_key="PA_BSND",                              # Paged Attention, B×S×N×D
+    sparse_count=self.index_topk,                      # k = 2048 (Top-k 选择)
+    sparse_mode=3,                                     # SFA模式
+)
+# topk_indices: [tokens, index_topk] — 每个 token 选中的历史 token 下标
+# 对应公式中的 S_t 集合
+return topk_indices[0]
+```
+
+#### 5. Sparse Flash Attention
+
+> 对应公式:
+> $$o_{t,i} = \sum_{j \in \mathcal{S}_t} \text{Softmax}_j(\frac{q_{t,i}^\top k_{j,i}}{\sqrt{d_h + d_h^R}}) v_{j,i}^C$$
+>
+> 吸收模式下 `query=q_nope_out` (已乘 $W_{UK}^\top$), `key=value=k_nope` ($c_t^{KV}$ 潜向量)
+
+```python
+# ascend_backend.py :: forward_sparse
+def forward_sparse(self, q, k, v, layer, forward_batch,
+                   q_rope=None, k_rope=None, topk_indices=None):
+    # 保存 KV cache
+    if save_kv_cache:
+        k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
+        k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            layer, forward_batch.out_cache_loc, k, k_rope
+        )
+
+    q_nope, q_pe = q, q_rope                        # Q: 已吸收 [tokens, n_heads, kv_lora_rank]
+    k_nope, k_pe = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+    # 调用 NPU 稀疏注意力算子
+    attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+        query=q_nope,                                # 吸收后 Q: [tokens, n_heads, kv_lora_rank]
+        key=k_nope,                                  # c_t^{KV} cache
+        value=k_nope,                                # MQA模式: value == key (吸收)
+        query_rope=q_pe,                             # Q RoPE: [tokens, n_heads, rope_dim]
+        key_rope=k_pe,                               # K RoPE cache
+        sparse_indices=topk_indices,                 # S_t: 稀疏选择的 token 下标
+        scale_value=layer.scaling,                   # 1/√(d_h + d_h^R)
+        block_table=self.forward_metadata.block_tables,
+        sparse_block_size=1,
+        layout_query="TND",
+        layout_kv="PA_BSND",
+        sparse_mode=3,
+        attention_mode=2,                            # Sparse MLA
+    )
+    # attn_out: [tokens, n_heads, kv_lora_rank] — 对应 o_{t,i} (吸收模式)
+    return attn_out
+```
+
+#### 6. V解压缩 + 输出投影 + 层间 TopK 复用
+
+> V解压缩对应: $v_t^C = W_{UV} c_t^{KV}$
+
+```python
+# deepseek_v2_attention_mla_npu.py :: forward_dsa_core_npu
+attn_output = m.attn_mqa(
+    q_nope_out.contiguous(),                         # 吸收后 Q
+    k_nope.contiguous(),                             # c_t^{KV}
+    k_nope.contiguous(),                             # value = key (MQA)
+    forward_batch, save_kv_cache=True,
+    q_rope=q_pe.contiguous(), k_rope=k_pe.contiguous(),
+    topk_indices=topk_indices,
+)
+attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
+# attn_output: [tokens, n_heads, kv_lora_rank]
+
+# V解压缩: bmm(attn_output, W_UV) → [tokens, n_heads, v_head_dim]
+attn_bmm_output = torch.empty(
+    (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
+    dtype=attn_output.dtype, device=attn_output.device,
+)
+attn_output = attn_output.contiguous()
+torch.ops.npu.batch_matmul_transpose(                # NPU 加速 batched matmul
+    attn_output, m.w_vc, attn_bmm_output
+)
+# 输出投影: W_O
+attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
+output, _ = m.o_proj(attn_bmm_output)
+
+# ============ 层间 TopK 复用 ============
+# 根据 index_topk_freq / index_topk_pattern 控制哪些层跳过 Indexer 计算
+# 参考论文: https://arxiv.org/abs/2603.12201
+if not m.next_skip_topk:
+    return output, None        # 下层不需要复用 topk_indices
+else:
+    return output, topk_indices # 传递给下层复用
+```
+
+**层间复用配置** (`deepseek_v2.py:1263-1275`):
+
+```python
+# 两种模式控制层间 topk 复用:
+self.index_topk_freq = getattr(config, "index_topk_freq", 1)
+# index_topk_freq=1: 每层都算 Indexer
+# index_topk_freq=2: 每2层算一次, 奇数层复用上层结果
+
+self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
+# pattern="ABAB": A=计算, B=跳过, 如 ["A","B","A","B","A","B"...]
+if self.index_topk_pattern is None:
+    self.skip_topk = max(layer_id - 1, 0) % self.index_topk_freq != 0
+    self.next_skip_topk = layer_id % self.index_topk_freq != 0
+else:
+    self.skip_topk = self.index_topk_pattern[layer_id] == "S"      # Skip
+    self.next_skip_topk = self.index_topk_pattern[layer_id + 1] == "S"
+```
+
+### 与 MindIE / vLLM-Ascend 关键差异
+
+| 维度 | MindIE | vLLM-Ascend | SGLang |
+|------|--------|-------------|--------|
+| Indexer 抽象 | inline 在 sparse_attention.py | 内嵌在 AscendSFAImpl | **独立 Indexer 类 (MultiPlatformOp)** |
+| Index K Cache | bf16 (不量化) | bf16 (不量化) | **bf16 (不量化)** |
+| CUDA Index Cache | N/A | N/A | **FP8 量化 (Hadamard + dynamic_quant)** |
+| RoPE 算子 (Indexer) | `npu_interleave_rope` | `npu_rotary_mul` | **`npu_rotary_mul`** |
+| 多流策略 | 单流 | 单流融合算子 (MLAPO) | **多流重叠 weights, 也有MLAPO** |
+| Skip-TopK | 无 | 无 | **支持 freq/pattern 层间复用** |
+| 路由方式 | 直接调用 | 继承体系 (extends MLAAttentionImpl) | **Backend Registry → DSA_NPU 独立路径** |
+| CP支持 | Indexer + Attn 各自CP | Indexer + Attn 各自CP | **Indexer + Attn 各自有 CP balance** |
+| Attention 调用 | `npu_sparse_flash_attention` | `npu_sparse_flash_attention` | `npu_sparse_flash_attention` |
+
+**三个项目在 NPU 上的共识：**
+- Indexer K Cache 都存 bf16，不做量化（与 CUDA 路径的 FP8 量化不同）
+- Indexer K 都是单头（`unsqueeze(1)`），对应公式中 $k_s^I$ 为所有 $H_I$ 头共享
+- 稀疏注意力都仅实现 MQA（吸收）版本：`key=value=c_kv`, `query=absorbed_q`
+- 底层都调用同一个 NPU 算子：`npu_sparse_flash_attention(sparse_mode=3, attention_mode=2)`
