@@ -20,6 +20,10 @@
 
 ---
 
+![MLA_MHA](../assets/MLA_MHA.jpg)
+
+![MLA_MQA](../assets/MLA_MQA.jpg)
+
 ## 1.2 KV 生成与压缩
 
 仅缓存 $c_t^{KV}$ 和 $k_t^R$ 以节省显存。
@@ -66,10 +70,6 @@ $$
 |------|----------|----------|
 | **MHA (非吸收)** | 分别计算 $k_{t,i}, v_{t,i}$，按头存储 | 每头独立的 K/V cache |
 | **MQA (吸收)** | 将 $W_{UK}, W_{UV}$ 吸收进 Q/O，仅存 $c_t^{KV}$ | 仅存 $c_t^{KV}$ 和共享的 $k_t^R$ |
-
-![MLA_MHA](../assets/MLA_MHA.jpg)
-
-![MLA_MQA](../assets/MLA_MQA.jpg)
 
 ---
 
@@ -183,6 +183,10 @@ SFA 在 MLA 基础上增加了 **Lightning Indexer**，用于计算 token 级别
 | $c_s$ | 压缩后的 KV 条目 | $u_t$ | 注意力输出 |
 | $\text{Top-k}$ | 前 $k$ 个高分选择 | | |
 
+![DSA_MHA](../assets/DSA_MHA.jpg)
+
+![DSA_MQA](../assets/DSA_MQA.jpg)
+
 ## 2.2 索引分数计算
 
 计算当前 token $t$ 与历史 token $s$ 之间的相关性分数：
@@ -208,10 +212,6 @@ u_t &= \text{Attn}( h_t, \{ c_s \mid s \in \mathcal{S}_t \} ) & \quad & \text{(�
 $$
 
 * 仅对索引分数最高的 $k$ 个历史 token 对应的 $c_s$ 进行注意力运算。
-
-![DSA_MHA](../assets/DSA_MHA.jpg)
-
-![DSA_MQA](../assets/DSA_MQA.jpg)
 
 ## 2.4 参考代码：DeepSeek-V3.2 官方 `inference/model.py`
 
