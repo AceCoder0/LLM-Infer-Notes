@@ -197,7 +197,7 @@ I_{t,s} &= \sum_{j=1}^{H_I} w_{t,j}^I \cdot \text{ReLU}( q_{t,j}^I \cdot k_s^I )
 \end{aligned}
 $$
 
-* $q_{t,j}^I, w_{t,j}^I$ 源自 $h_t$；$k_s^I$ 源自 $h_s$。
+* $q_{t,j}^I, w_{t,j}^I$ 源自 $h_t$；$k_{s}^I$ 源自 $h_s$。
 * 采用 ReLU 激活函数以提升吞吐量。
 
 ## 2.3 稀疏选择与注意力
@@ -341,7 +341,7 @@ V4 在 MLA 基础上做了进一步简化与改进：
 
 1. **纯 MQA**：彻底取消多头 KV，仅保留单头 $kv_{proj}$，$K=V$ 共享同一份投影。
 2. **Partial RoPE**：仅对前 `rope_head_dim` 个维度施加 RoPE，并在 Attention 输出后对 rope slice 施加共轭旋转（`-sin`），保证相对位置不变性。
-3. **Grouped Low-rank Output Projection**：$W_O$ 拆分为 $W_{Oa}$ (GroupedLinear) + $W_{Ob}$，降低输出投影参数量。
+3. **Grouped Low-rank Output Projection**：$W_{O}$ 拆分为 $W_{Oa}$ (GroupedLinear) + $W_{Ob}$，降低输出投影参数量。
 4. **Attention Sink**：每头引入可学习的标量 `sinks`，作为全局 attention sink。
 5. **分层 Cache 机制**：
    - `sliding_attention`：纯滑动窗口，无压缩。
