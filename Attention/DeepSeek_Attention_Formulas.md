@@ -357,7 +357,7 @@ V4 在 MLA 基础上做了进一步简化与改进：
 $$
 \begin{aligned}
 c_t^Q &= W_{DQ} h_t \\
-q_{t,i} &= W_{UQ} c_t^Q \quad \text{再经 } q\_b\_norm + \text{RoPE}
+q_{t,i} &= W_{UQ} c_t^Q \quad \text{(再经 q\_b\_norm + RoPE)}
 \end{aligned}
 $$
 
@@ -372,12 +372,12 @@ $$
 
 ### 压缩 KV (CSA / HCA)
 
-压缩器将滑动窗口外的历史 token 聚合成少量压缩条目 $C^{Comp}$：
+压缩器将滑动窗口外的历史 token 聚合成少量压缩条目 $C^{\text{Comp}}$：
 
 $$
 \begin{aligned}
 \text{compressed\_kv} &= \text{Compressor}(h_t, c_t^Q, \dots) \\
-k_t^{total} &= [k_t^{sliding}; \text{compressed\_kv}] \quad \text{(拼接滑动窗口 + 压缩条目)}
+k_t^{\text{total}} &= \big[\, k_t^{\text{sliding}}; \text{compressed\_kv} \,\big] \quad \text{(拼接滑动窗口 + 压缩条目)}
 \end{aligned}
 $$
 
