@@ -357,7 +357,7 @@ V4 在 MLA 基础上做了进一步简化与改进：
 $$
 \begin{aligned}
 c_t^Q &= W_{DQ} h_t \\
-q_{t,i} &= W_{UQ} c_t^Q \quad \text{(再经 q\_b\_norm + RoPE)}
+q_{t,i} &= W_{UQ} c_t^Q \quad \text{(再经 q-b-norm + RoPE)}
 \end{aligned}
 $$
 
@@ -376,8 +376,8 @@ $$
 
 $$
 \begin{aligned}
-\text{compressed\_kv} &= \text{Compressor}(h_t, c_t^Q, \dots) \\
-k_t^{\text{total}} &= \big[\, k_t^{\text{sliding}}; \text{compressed\_kv} \,\big] \quad \text{(拼接滑动窗口 + 压缩条目)}
+\text{compressed-kv} &= \text{Compressor}(h_t, c_t^Q, \dots) \\
+k_t^{\text{total}} &= \big[\, k_t^{\text{sliding}}; \text{compressed-kv} \,\big] \quad \text{(拼接滑动窗口 + 压缩条目)}
 \end{aligned}
 $$
 
