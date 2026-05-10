@@ -1,0 +1,3825 @@
+diff --git a/docs/zh/developer_guide/RoPEFactoryGuide.md b/docs/zh/developer_guide/RoPEFactoryGuide.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..94e4bcdc5ce4deb78851c33735454110579e886b
+--- /dev/null
++++ b/docs/zh/developer_guide/RoPEFactoryGuide.md
+@@ -0,0 +1,227 @@
++# get_rope 使用指南
++
++## 概述
++
++`get_rope` 提供了一个灵活的注册机制来创建和管理不同类型的 Rotary Position Embedding (RoPE) 实例。通过注册机制，模型特定的 RoPE 实现可以放在各自的模型文件中，而不是集中在工厂类中。
++
++## 核心特性
++
++1. **注册机制**：通过 `@register_rope_type` 装饰器注册自定义 RoPE 类型
++2. **自动缓存**：相同配置的 RoPE 实例会被自动缓存，避免重复创建
++3. **模型特定支持**：模型特定的外推方式（如 DeepseekV3YarnRotaryEmbedding）可以在模型文件中注册
++
++## 使用方式
++
++### 1. 使用默认或者已经注册 RoPE
++
++```python
++from mindie_llm.runtime.layers.embedding.rotary_embedding import get_rope
++
++self.rope_emb = get_rope(
++            self.head_dim,
++            self.head_dim,
++            self.config.rope_scaling.max_position_embeddings,
++            is_neox_style=True,
++            rope_config=config.rope_scaling,
++        )
++        
++ ...
++ # 使用方式
++ # 根据postions设置cos_sin_indexed_cache
++self.layers[0].self_attn.rope_emb.set_cos_sin_indexed_cache(positions)
++...
++ # 1. 调用forward直接对query,key进行rope变换
++query, key = self.rope_emb(positions, query, key) 
++...
++# 2. 直接拿出cos, sin交给attention 后端使用
++return self.attn(hidden_states,
++                        cos=self.rope_emb.cos_indexed_cache,
++                        sin=self.rope_emb.sin_indexed_cache)
++```
++
++
++### 2. 实现模型特定的 RoPE 类型 （以deepseekv3为例）
++
++#### 2.1 rope模块实现
++在模型目录下定义自己的rope实现（例如 `mindie_llm/runtime/layers/embedding/rotary_embedding/deepseek_v3_yarn_scaling_rope.py`）：
++> 可以选择继承mindie_llm/runtime/layers/embedding/rotary_embedding/base.py下的RotaryEmbedding
++
++> 或者继承mindie_llm/runtime/layers/embedding/rotary_embedding/yarn_scaling_rope.py 下的YarnScalingRotaryEmbedding用于外推
++
++```python
++from mindie_llm.runtime.layers.embedding.rotary_embedding.yarn_scaling_rope import (
++    YarnScalingRotaryEmbedding,
++    yarn_get_mscale
++)
++
++
++class DeepseekV3YarnRotaryEmbedding(YarnScalingRotaryEmbedding):
++    """DeepSeek-V3 specialized YaRN rotary embedding with mscale_all_dim scaling.
++
++    Extends standard YaRN scaling with DeepSeek-V3's additional magnitude scaling
++    parameter (mscale_all_dim) for fine-grained attention magnitude control.
++    """
++    def __init__(
++        self,
++        dim,
++        original_max_position_embeddings=4096,
++        base=10000,
++        factor=1.0,
++        beta_fast=32,
++        beta_slow=1,
++        is_neox_style=True,
++        dtype=None,
++        mscale=1.0,
++        mscale_all_dim=1.0,
++    ) -> None:
++        """Initialize DeepSeek-V3 YaRN rotary embedding.
++
++        Args:
++            dim: Rotary embedding dimension (applied to both head and rotary dims).
++            original_max_position_embeddings: Original context length before scaling.
++            base: Base frequency for rotary embedding (theta).
++            factor: Context extension scaling factor (>1.0 for extrapolation).
++            beta_fast: YaRN fast decay window parameter.
++            beta_slow: YaRN slow decay window parameter.
++            is_neox_style: Use NeoX-style interleaved rotation (default: True).
++            dtype: Data type for embedding tensors (e.g., torch.float16).
++            mscale: Base magnitude scaling factor for attention preservation.
++            mscale_all_dim: DeepSeek-V3 specific scaling factor applied across all dimensions.
++        """
++        self.mscale_all_dim = mscale_all_dim
++        super().__init__(dim, dim, original_max_position_embeddings, base,
++        dtype=dtype,
++            is_neox_style=is_neox_style,
++            factor=factor,
++            beta_fast=beta_fast,
++            beta_slow=beta_slow,
++            mscale=mscale
++        )
++    
++    def set_cos_sin_indexed_cache(self, postions) -> None:
++        """Create position-indexed cosine/sine caches with dimension doubling.
++
++        Extracts position-specific rotary values from precomputed caches and
++        duplicates them across the last dimension to match attention head layout.
++
++        Args:
++            postions: 1D tensor of position indices to index into the cache.
++        """
++        cos_indexed_cache = torch.index_select(self.cos_cache, dim=0, index=postions.view(-1)).unsqueeze(1).unsqueeze(1)
++        sin_indexed_cache = torch.index_select(self.sin_cache, dim=0, index=postions.view(-1)).unsqueeze(1).unsqueeze(1) 
++        cos_indexed_cache = torch.cat((cos_indexed_cache, cos_indexed_cache), dim=-1)
++        sin_indexed_cache = torch.cat((sin_indexed_cache, sin_indexed_cache), dim=-1)
++        self.register_buffer("cos_indexed_cache", cos_indexed_cache, persistent=False) # [seq_len, 1, 1, rotary_dim]
++        self.register_buffer("sin_indexed_cache", sin_indexed_cache, persistent=False)
++
++    def _compute_cos_sin_cache(self) -> None:
++        """Precompute cosine/sine caches with DeepSeek-V3 specific magnitude scaling.
++
++        Applies dual scaling factors (mscale and mscale_all_dim) to preserve attention
++        magnitude during context extrapolation. The effective scale is mscale/mscale_all_dim.
++        """
++        t = torch.arange(
++            self.max_position_embeddings
++        ).to(torch.float32)
++        freqs = torch.einsum("i,j -> ij", t, self.inv_freq)
++        _mscale = float(
++            yarn_get_mscale(self.scaling_factor, self.mscale)
++            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
++        )
++        cos = freqs.cos().to(self.dtype) * _mscale
++        sin = freqs.sin().to(self.dtype) * _mscale
++        self.register_buffer("cos_cache", cos, persistent=False) # [max_position_embeddings, rotary_dim // 2]
++        self.register_buffer("sin_cache", sin, persistent=False) # [max_position_embeddings, rotary_dim // 2]
++
++```
++
++#### 2.2  实现自定义的rope构造函数并注册
++
++注册函数必须使用装饰器@register_rope_type("xxxx")
++@cached_rope_factory：
++
++```python
++@register_rope_type("deepseek_yarn")
++@cached_rope_factory
++def _create_deepseek_scaling_rope(
++    head_size: int,
++    rotary_dim: int,
++    max_position: int,
++    base: float,
++    is_neox_style: bool,
++    dtype: torch.dtype,
++    rope_config: RopeScaling,
++) -> RotaryEmbedding:
++    """Factory function for creating DeepSeek-V3 YaRN-scaled RotaryEmbedding.
++
++    Specialized implementation for DeepSeek-V3 architecture with YaRN scaling
++    and DeepSeek-specific parameters like mscale_all_dim.
++
++    Args:
++        head_size: Dimension of each attention head.
++        rotary_dim: Dimensionality of the rotary embedding subspace.
++        max_position: Target maximum sequence length after scaling.
++        base: Base value for frequency computation (theta).
++        is_neox_style: Whether to use NeoX-style interleaved rotation.
++        dtype: Data type for embedding tensors.
++        rope_config: Configuration object containing DeepSeek-specific parameters:
++            - original_max_position_embeddings: Original context length before scaling
++            - factor: Scaling factor for context extension
++            - beta_fast/beta_slow: YaRN attention window parameters
++            - mscale: Magnitude scaling factor
++            - mscale_all_dim: DeepSeek-specific magnitude scaling dimension parameter
++
++    Returns:
++        Initialized DeepseekV3YarnRotaryEmbedding instance.
++    """
++    ds_yarn_extra_keys = (
++        "factor",
++        "beta_fast",
++        "beta_slow",
++        "mscale",
++        "mscale_all_dim"
++        )
++    extra_kwargs = {
++        k: getattr(rope_config, k)
++        for k in ds_yarn_extra_keys
++    }
++    return DeepseekV3YarnRotaryEmbedding(
++        rotary_dim,
++        rope_config.original_max_position_embeddings,
++        base,
++        is_neox_style=is_neox_style,
++        dtype=dtype,
++        **extra_kwargs,
++    )
++```
++
++## 缓存机制
++
++`get_rope` 会自动缓存相同配置的 RoPE 实例。缓存键基于：
++- `head_size`
++- `rotary_dim` (由 `head_size * partial_rotary_factor` 计算)
++- `max_position`
++- `is_neox_style`
++- `base`
++- `rope_config` (列表会被转换为元组以确保稳定性)
++- `dtype`
++
++这意味着相同配置的多次调用会返回同一个实例，节省内存和计算资源。
++
++## 已注册的类型
++
++- `default`: 标准 RotaryEmbedding（默认）
++- `yarn`: YarnScalingRotaryEmbedding
++- `deepseek_yarn`: DeepseekV3YarnRotaryEmbedding
++
++## 注意事项
++
++1. **模型特定rope实现应在mindie_llm/runtime/layers/embedding/rotary_embedding目录下单独文件**：如 `DeepseekV3YarnRotaryEmbedding` 应该在 `mindie_llm/runtime/layers/embedding/rotary_embedding` 目录下的文件中注册，而不是在 `rotary_embedding/__init__.py` 中。
++
++2. **注册时机**：确保在使用 `get_rope` 之前完成注册。通常这发生在模块导入时。
++
++3. **参数提取**：注册函数应该从 `rope_config` 中提取所需的参数，而不是期望所有参数都通过位置参数传递。
++
++4. **向后兼容**：现有的代码无需修改即可继续工作，如果新增模型需要新的rope，请单独实现自己的rope模块并注册使用，做增量修改，不要修改原有代码，否则须测试相关场景。
++
++
+diff --git a/mindie_llm/modeling/model_wrapper/aclgraph/aclgraph_model_wrapper_exp.py b/mindie_llm/modeling/model_wrapper/aclgraph/aclgraph_model_wrapper_exp.py
+index 03d1aba3ffa92f89318d3bf4463e9a3f9a964a9e..1c8fa73d33947ab92f8ff006f959276e09b97371 100644
+--- a/mindie_llm/modeling/model_wrapper/aclgraph/aclgraph_model_wrapper_exp.py
++++ b/mindie_llm/modeling/model_wrapper/aclgraph/aclgraph_model_wrapper_exp.py
+@@ -83,6 +83,7 @@ class AclGraphModelWrapperExp(ModelWrapper):
+             moe_tp=kwargs.get('moe_tp', -1),
+             moe_ep=kwargs.get('moe_ep', -1),
+             role=kwargs.get('role', 'standard'),
++            max_seq_len=kwargs.get("max_seq_len", -1),
+             sampler_config=kwargs.get('sampler_config', None),
+             distributed_enable=kwargs.get("distributed_enable", False),
+         )
+diff --git a/mindie_llm/runtime/config/huggingface_config.py b/mindie_llm/runtime/config/huggingface_config.py
+index b66a64a496243f08a3df4b3e81b15916ed364f0d..f800216b2ddaa4a15300923e4e703eeb1788ae5c 100644
+--- a/mindie_llm/runtime/config/huggingface_config.py
++++ b/mindie_llm/runtime/config/huggingface_config.py
+@@ -59,24 +59,41 @@ class GenerationConfig:
+ 
+ 
+ @dataclass
+-class RopeScaling:
+-    """RoPE embedding scaling configuration."""
+-    factor: float = field(default=1.0, metadata={
+-        'validator': FloatParameterValidator(Field(ge=-65504, le=65504))})
+-    rope_type: str = field(default='linear', metadata={
+-        'validator': RangeParamaterValidator(['linear', 'dynamic', 'yarn'])})
+-    original_max_position_embeddings: int | None = field(default=None, metadata={
+-        'validator': IntParameterValidator(Field(ge=1, le=2147483647), allow_none=True)})
+-    beta_fast: int | None = field(default=32, metadata={
+-        'validator': IntParameterValidator(Field(ge=1, le=2147483647))})
+-    beta_slow: int | None = field(default=1, metadata={
+-        'validator': IntParameterValidator(Field(ge=1, le=2147483647))})
+-
++class BaseRopeScaling:
++    """Base class for RoPE scaling configuration.
++    
++    Provides the basic fields rope_theta and max_position_embeddings.
++    Each model should implement its own RopeScaling class that inherits from this base class.
++    """
++    rope_theta: float = field(default=1000000.0, metadata={
++        'validator': FloatParameterValidator(Field(ge=-1e9, le=1e9))
++    })
++    
++    max_position_embeddings: int | None = field(default=None, metadata={
++        'validator': IntParameterValidator(Field(ge=1, le=2147483647), allow_none=True)
++    })
++    
+     @classmethod
+-    def from_dict(cls, config_dict: dict[str, Any]):
+-        field_names = {field.name for field in fields(cls)}
+-        filtered_dict = {k: v for k, v in config_dict.items() if k in field_names}
+-        return cls(**filtered_dict)
++    def from_dict(cls, config_dict: dict[str, Any], 
++                  rope_theta: float = 1000000.0,
++                  max_position_embeddings: int | None = None) -> 'BaseRopeScaling':
++        """Create BaseRopeScaling instance from config dictionary.
++        
++        Args:
++            config_dict: The rope_scaling dictionary from config.json
++            rope_theta: The model's rope_theta value
++            max_position_embeddings: The model's max_position_embeddings value
++            
++        Returns:
++            Configured BaseRopeScaling instance
++        """
++        if config_dict is None:
++            config_dict = {}
++        
++        return cls(
++            rope_theta=rope_theta,
++            max_position_embeddings=max_position_embeddings
++        )
+ 
+ 
+ @dataclass
+@@ -104,14 +121,26 @@ class HuggingFaceConfig(PretrainedConfig):
+     bos_token_id: int | None = None
+     eos_token_id: int | list[int | list[int]] = None
+     
+-    rope_scaling: RopeScaling | None = None
++    rope_scaling: BaseRopeScaling | None = None
+ 
+     def __init__(self, **kwargs):
+         super().__init__(**kwargs)
+-        if self.rope_scaling is None:
+-            self.rope_scaling = {}
+-        self.rope_scaling = RopeScaling.from_dict(self.rope_scaling)
+-
++        rope_scaling_dict = kwargs.get('rope_scaling', None)
++        rope_theta = kwargs.get('rope_theta', 1000000.0)
++        max_position_embeddings = kwargs.get('max_position_embeddings', None)
++        
++        if hasattr(self, '_create_rope_scaling'):
++            self.rope_scaling = self._create_rope_scaling(
++                rope_scaling_dict or {},
++                rope_theta,
++                max_position_embeddings
++            )
++        else:
++            self.rope_scaling = BaseRopeScaling.from_dict(
++                rope_scaling_dict,
++                rope_theta=rope_theta,
++                max_position_embeddings=max_position_embeddings
++            )
+ 
+     @classmethod
+     def from_dict(cls, config_dict: dict[str, Any]) -> 'HuggingFaceConfig':
+diff --git a/mindie_llm/runtime/layers/attention/backend/fia_attention.py b/mindie_llm/runtime/layers/attention/backend/fia_attention.py
+index 6d5d0e0f78c0b40c2f288ce036e7726f42ad142e..389b0a24effddf6ebfe4b6421c92b05116ed2b5d 100644
+--- a/mindie_llm/runtime/layers/attention/backend/fia_attention.py
++++ b/mindie_llm/runtime/layers/attention/backend/fia_attention.py
+@@ -60,14 +60,12 @@ class FiaAttentionMetadata(AttentionMetadata):
+     # The following attributes are only filled by `from_model_input`.
+ 
+     @staticmethod
+-    def from_model_input(model_inputs, cos_table, sin_table, mask, num_speculative_tokens=0):
++    def from_model_input(model_inputs, mask, num_speculative_tokens=0):
+         return FiaAttentionMetadata(
+             seq_lens=model_inputs.context_length,
+             slot_mapping=model_inputs.slots,
+             block_tables=model_inputs.block_tables,
+             attn_mask=mask,
+-            cos_table=cos_table,
+-            sin_table=sin_table,
+             max_seq_len=model_inputs.max_seq_len,
+         )
+ 
+@@ -120,8 +118,6 @@ class FiaAttentionMetadataBuilder:
+             slot_mapping=common_attn_metadata.slot_mapping,
+             block_tables=common_attn_metadata.block_tables,
+             attn_mask=common_attn_metadata.attn_mask,
+-            cos_table=common_attn_metadata.cos_table,
+-            sin_table=common_attn_metadata.sin_table
+         )
+         return attn_metadata
+ 
+diff --git a/mindie_llm/runtime/layers/attention/backend/sparse_attention.py b/mindie_llm/runtime/layers/attention/backend/sparse_attention.py
+index 68e721409d442dc3bc16a7a4f5ac2c6980fd0083..1624bd424079cd8356a5725d6008c94f5ae90801 100644
+--- a/mindie_llm/runtime/layers/attention/backend/sparse_attention.py
++++ b/mindie_llm/runtime/layers/attention/backend/sparse_attention.py
+@@ -203,7 +203,7 @@ class SfaMetadata(AttentionMetadata):
+     mc2_mask: torch.Tensor | None = None
+ 
+     @staticmethod
+-    def from_model_input(model_inputs, cos_table, sin_table, mask, num_speculative_tokens=0):
++    def from_model_input(model_inputs, mask, num_speculative_tokens=0):
+         if model_inputs.is_prefill:
+             actual_seq_lengths_kv = torch.tensor(model_inputs.context_length, dtype=torch.int32)
+         else:
+@@ -225,8 +225,6 @@ class SfaMetadata(AttentionMetadata):
+             slot_mapping=model_inputs.slots,
+             block_tables=model_inputs.block_tables,
+             attn_mask=mask,
+-            cos_table=cos_table,
+-            sin_table=sin_table,
+             actual_seq_lengths_kv=actual_seq_lengths_kv,
+             actual_seq_lengths_query=actual_seq_lengths_query,
+             num_speculative_tokens=num_speculative_tokens,
+@@ -321,7 +319,7 @@ class SfaMetadata(AttentionMetadata):
+         self.actual_seq_lengths_query = input_buffer.get("actual_seq_lengths_query")[:reqs_padding_length]
+ 
+ 
+-class SfaMetadataBuilder: 
++class SfaMetadataBuilder:
+     # NOTE: This class is used for building attention metadata in the future.
+     @staticmethod
+     def build(
+@@ -344,8 +342,6 @@ class SfaMetadataBuilder:
+             slot_mapping=common_attn_metadata.slot_mapping,
+             block_tables=common_attn_metadata.block_tables,
+             attn_mask=common_attn_metadata.attn_mask,
+-            cos_table=common_attn_metadata.cos_table,
+-            sin_table=common_attn_metadata.sin_table,
+             actual_seq_lengths_kv=input_metadata["actual_seq_lengths_kv"],
+             actual_seq_lengths_query=input_metadata["actual_seq_lengths_query"],
+             cp_input_dict=cp_input_dict
+@@ -619,16 +615,15 @@ class SfaBackendImpl(SelectAttentionImpl):
+             hidden_state: torch.Tensor,
+             q_c: torch.Tensor,
+             forward_context: ForwardContext, 
+-            attn_metadata: SfaMetadata
++            attn_metadata: SfaMetadata,
++            cos, sin
+         ):
+         q = self.indexer.wq_b(q_c) 
+         q = q.view(-1, self.indexer.n_heads, self.indexer.head_dim)
+         q_pe, q_nope = torch.split(q, [self.qk_rope_head_dim, self.indexer.head_dim - self.qk_rope_head_dim], dim=-1)
+ 
+         q_pe = q_pe.unsqueeze(2)
+-        q_pe = torch_npu.npu_interleave_rope(q_pe,
+-                                             attn_metadata.cos_table,
+-                                             attn_metadata.sin_table)
++        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin)
+         q_pe = q_pe.squeeze(2)
+         q = torch.cat([q_pe, q_nope], dim=-1)
+ 
+@@ -637,11 +632,10 @@ class SfaBackendImpl(SelectAttentionImpl):
+         k_pe, k_nope = torch.split(k, [self.qk_rope_head_dim, self.indexer.head_dim - self.qk_rope_head_dim], dim=-1)
+         k_pe = k_pe.unsqueeze(2)
+         k_pe = torch_npu.npu_interleave_rope(k_pe,
+-                                             attn_metadata.cos_table.view(-1, 1, 1, self.qk_rope_head_dim),
+-                                             attn_metadata.sin_table.view(-1, 1, 1, self.qk_rope_head_dim))
++                                             cos.view(-1, 1, 1, self.qk_rope_head_dim),
++                                             sin.view(-1, 1, 1, self.qk_rope_head_dim))
+         k_pe = k_pe.squeeze(2)
+         k = torch.cat([k_pe, k_nope], dim=-1)
+-
+         # cp
+         cp_input_dict = attn_metadata.cp_input_dict
+         if forward_context.is_prefill and self.cp_size > 1:
+@@ -687,7 +681,9 @@ class SfaBackendImpl(SelectAttentionImpl):
+         q_c: torch.Tensor,
+         kv_no_split: torch.Tensor,
+         forward_context: ForwardContext,
+-        attn_metadata: AttentionMetadata
++        attn_metadata: AttentionMetadata,
++        cos,
++        sin
+     ):
+         decode_q = self.q_b_proj(q_c)
+         bsz, _ = decode_q.shape
+@@ -703,16 +699,16 @@ class SfaBackendImpl(SelectAttentionImpl):
+         )
+ 
+         kv_no_split = kv_no_split.unsqueeze(1).unsqueeze(1)
+-        cos_cache, sin_cache = attn_metadata.cos_table, attn_metadata.sin_table
++        cos_cache, sin_cache = cos, sin
+         is_output_kv = False
+         cp_kv_recover_idx_key = "cp_kv_recover_idx"
+         if forward_context.is_prefill and self.cp_size > 1:
+             cp_input_dict = attn_metadata.cp_input_dict
+             kv_no_split = allgather_and_reorder(kv_no_split, self.parallel_info.attn_cp.process_group, \
+                 cp_input_dict[cp_kv_recover_idx_key])
+-            cos_cache = allgather_and_reorder(attn_metadata.cos_table, self.parallel_info.attn_cp.process_group, \
++            cos_cache = allgather_and_reorder(cos, self.parallel_info.attn_cp.process_group, \
+                 cp_input_dict[cp_kv_recover_idx_key])
+-            sin_cache = allgather_and_reorder(attn_metadata.sin_table, self.parallel_info.attn_cp.process_group, \
++            sin_cache = allgather_and_reorder(sin, self.parallel_info.attn_cp.process_group, \
+                 cp_input_dict[cp_kv_recover_idx_key])
+             is_output_kv = True
+ 
+@@ -730,12 +726,12 @@ class SfaBackendImpl(SelectAttentionImpl):
+             is_output_kv=is_output_kv)
+         
+         decode_q_pe = torch_npu.npu_interleave_rope(decode_q_pe,
+-                                                    attn_metadata.cos_table,
+-                                                    attn_metadata.sin_table)
++                                                    cos,
++                                                    sin)
+ 
+         decode_q_nope = decode_q_nope.view(bsz, self.num_heads_per_rank, self.kv_lora_rank)
+         decode_q_pe = decode_q_pe.view(bsz, self.num_heads_per_rank, -1)
+-        topk_indices = self.indexer_select(hidden_states, q_c, forward_context, attn_metadata)
++        topk_indices = self.indexer_select(hidden_states, q_c, forward_context, attn_metadata, cos, sin)
+         key_states = None
+         if forward_context.is_prefill and self.cp_size > 1:
+             key_states = (k_nope_a, k_rope_a)
+@@ -756,7 +752,9 @@ class SfaBackendImpl(SelectAttentionImpl):
+         q_c: torch.Tensor,
+         kv_no_split: torch.Tensor,
+         forward_context: ForwardContext,
+-        attn_metadata: AttentionMetadata
++        attn_metadata: AttentionMetadata,
++        cos,
++        sin
+     ):
+         decode_q = self.q_b_proj(q_c)
+         bsz, _ = decode_q.shape
+@@ -775,8 +773,8 @@ class SfaBackendImpl(SelectAttentionImpl):
+         decode_k_rope, decode_k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
+             kv_no_split,
+             self.kv_a_layernorm.weight,
+-            attn_metadata.cos_table,
+-            attn_metadata.sin_table,
++            cos,
++            sin,
+             attn_metadata.slot_mapping.to(torch.int64),
+             self.pe_cache,
+             self.kv_cache,
+@@ -784,12 +782,12 @@ class SfaBackendImpl(SelectAttentionImpl):
+             epsilon=self.kv_a_layernorm.variance_epsilon, cache_mode='PA')
+         
+         decode_q_pe = torch_npu.npu_interleave_rope(decode_q_pe,
+-                                                    attn_metadata.cos_table,
+-                                                    attn_metadata.sin_table)
++                                                    cos,
++                                                    sin)
+ 
+         decode_q_nope = decode_q_nope.view(bsz, self.num_heads_per_rank, self.kv_lora_rank)
+         decode_q_pe = decode_q_pe.view(bsz, self.num_heads_per_rank, -1)
+-        topk_indices = self.indexer_select(hidden_states, q_c, forward_context, attn_metadata)
++        topk_indices = self.indexer_select(hidden_states, q_c, forward_context, attn_metadata, cos, sin)
+         decode_preprocess_res = DecodeSFAPreprocessResult(
+             q_nope=decode_q_nope,
+             q_pe=decode_q_pe,
+@@ -804,7 +802,8 @@ class SfaBackendImpl(SelectAttentionImpl):
+         hidden_states: torch.Tensor,
+         q_c: torch.Tensor,
+         forward_context: ForwardContext,
+-        attn_metadata: AttentionMetadata
++        attn_metadata: AttentionMetadata,
++        cos, sin
+     ):
+         bsz, _ = hidden_states.shape
+ 
+@@ -819,8 +818,8 @@ class SfaBackendImpl(SelectAttentionImpl):
+             wuq=self.mlapo_weight_pack.wu_q,
+             descale1=self.mlapo_weight_pack.qb_deq_scl,
+             gamma2=self.mlapo_weight_pack.gamma2,
+-            cos=attn_metadata.cos_table,
+-            sin=attn_metadata.sin_table,
++            cos=cos,
++            sin=sin,
+             wuk=self.kv_b_proj_w_k,
+             kv_cache=self.kv_cache,
+             kv_cache_rope=self.pe_cache,
+@@ -841,7 +840,7 @@ class SfaBackendImpl(SelectAttentionImpl):
+         decode_q_nope = decode_q_nope.view(bsz, self.num_heads_per_rank, self.kv_lora_rank)
+         decode_q_pe = decode_q_pe.view(bsz, self.num_heads_per_rank, -1)
+ 
+-        topk_indices = self.indexer_select(hidden_states, q_c, forward_context, attn_metadata)
++        topk_indices = self.indexer_select(hidden_states, q_c, forward_context, attn_metadata, cos, sin)
+         decode_preprocess_res = DecodeSFAPreprocessResult(
+             q_nope=decode_q_nope,
+             q_pe=decode_q_pe,
+@@ -857,7 +856,8 @@ class SfaBackendImpl(SelectAttentionImpl):
+         hidden_states: torch.Tensor,
+         kv_cache: Tuple[torch.Tensor],
+         forward_context: ForwardContext,
+-        attn_metadata: AttentionMetadata
++        attn_metadata: AttentionMetadata,
++        cos, sin
+     ):
+         if self.kv_cache is None or id(self.kv_cache) != id(kv_cache[0]):
+             self.kv_cache, self.pe_cache, self.index_cache = kv_cache[0], kv_cache[1], kv_cache[2]
+@@ -872,7 +872,7 @@ class SfaBackendImpl(SelectAttentionImpl):
+                 hidden_states,
+                 q_c,
+                 forward_context,
+-                attn_metadata
++                attn_metadata, cos, sin
+             )
+             return decode_preprocess_res, prefill_preprocess_res
+ 
+@@ -883,7 +883,7 @@ class SfaBackendImpl(SelectAttentionImpl):
+                 q_c,
+                 kv_no_split,
+                 forward_context,
+-                attn_metadata
++                attn_metadata, cos, sin
+             )
+         else:
+             decode_preprocess_res = self.sfa_decode_preprocess(
+@@ -891,7 +891,7 @@ class SfaBackendImpl(SelectAttentionImpl):
+                 q_c,
+                 kv_no_split,
+                 forward_context,
+-                attn_metadata
++                attn_metadata, cos, sin
+             )
+ 
+         return decode_preprocess_res, prefill_preprocess_res
+@@ -1062,14 +1062,16 @@ class SfaBackendImpl(SelectAttentionImpl):
+         self,
+         layer: AttentionLayer,
+         hidden_states: torch.Tensor,
+-        kv_cache: Tuple[torch.Tensor] = None
++        kv_cache: Tuple[torch.Tensor] = None,
++        cos=None,
++        sin=None
+     ) -> torch.Tensor:
+ 
+         forward_context = get_forward_context()
+         attn_metadata = forward_context.attn_metadata_dict
+         if isinstance(attn_metadata, dict):
+             attn_metadata = attn_metadata[layer.prefix]
+-        attn_metadata.cos_table, attn_metadata.sin_table = layer.cos_sin
++
+         if forward_context.batch_descriptor.is_flash_comm_enabled:
+             hidden_states = maybe_all_gather_and_maybe_unpad(
+                 hidden_states,
+@@ -1079,12 +1081,13 @@ class SfaBackendImpl(SelectAttentionImpl):
+             hidden_states=hidden_states,
+             kv_cache=kv_cache,
+             forward_context=forward_context,
+-            attn_metadata=attn_metadata)
++            attn_metadata=attn_metadata,
++            cos=cos, sin=sin)
+         o_proj_input = self.forward_impl(
+                 prefill_preprocess_res=prefill_preprocess_res,
+                 decode_preprocess_res=decode_preprocess_res,
+                 forward_context=forward_context,
+-                attn_metadata=attn_metadata
++                attn_metadata=attn_metadata,
+             )
+         output = self.mla_epilog(o_proj_input)
+         return output
+\ No newline at end of file
+diff --git a/mindie_llm/runtime/layers/attention/sparse_attention_layer.py b/mindie_llm/runtime/layers/attention/sparse_attention_layer.py
+index c9ff0934c4a1822ff73c95f667092f78f35d5ae8..a5729677a7899d1a3d253429f4b9adb0a6c12b17 100644
+--- a/mindie_llm/runtime/layers/attention/sparse_attention_layer.py
++++ b/mindie_llm/runtime/layers/attention/sparse_attention_layer.py
+@@ -1,3 +1,7 @@
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-License-Identifier: Apache-2.0
++# Part of this file implemented based on vllm project.
++#
+ # Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
+ # MindIE is licensed under Mulan PSL v2.
+ # You can use this software according to the terms and conditions of the Mulan PSL v2.
+@@ -53,8 +57,8 @@ class SFA(AttentionLayerBase):
+     def get_attn_backend(self) -> type[AttentionBackend]:
+         return self.attn_backend
+ 
+-    def forward(self, hidden_states):
++    def forward(self, hidden_states, cos, sin):
+         self_kv_cache = (self.key_cache, self.value_cache, self.index_cache)
+         return self.impl.forward(
+-            self, hidden_states, self_kv_cache
++            self, hidden_states, self_kv_cache, cos=cos, sin=sin
+         )
+\ No newline at end of file
+diff --git a/mindie_llm/runtime/layers/embedding/position_rotary_embedding.py b/mindie_llm/runtime/layers/embedding/position_rotary_embedding.py
+deleted file mode 100644
+index 3b4a429a8cc2a2743c02651c3c9f1b810bd8f3e1..0000000000000000000000000000000000000000
+--- a/mindie_llm/runtime/layers/embedding/position_rotary_embedding.py
++++ /dev/null
+@@ -1,139 +0,0 @@
+-# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
+-# MindIE is licensed under Mulan PSL v2.
+-# You can use this software according to the terms and conditions of the Mulan PSL v2.
+-# You may obtain a copy of Mulan PSL v2 at:
+-#          http://license.coscl.org.cn/MulanPSL2
+-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+-# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+-# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+-# See the Mulan PSL v2 for more details.
+-
+-import math
+-from enum import Enum
+-
+-import torch
+-
+-from mindie_llm.runtime.layers.custom_layer import CustomLayer
+-
+-
+-class PositionEmbeddingType(int, Enum):
+-    ROPE = 0
+-
+-
+-class PositionRotaryEmbedding(CustomLayer):
+-    '''
+-    Positional Rotary Embedding (RoPE) module with scaling support.
+-    '''
+-
+-    def __init__(self, inv_freq: torch.Tensor, scaling_factor: float = 1.0, base: float = 10000.0):
+-        """
+-        Initialize rotary embedding with inverse frequencies.
+-
+-        Args:
+-            inv_freq: The inverse frequencies for RoPE.
+-            scaling_factor: Scaling factor for extended context
+-            base: Base value for frequency calculation (default: 10000).
+-        """
+-
+-        super().__init__()
+-
+-        self.base = base
+-        self.inv_freq = inv_freq
+-        self._seq_len_cached = 0
+-        self._cos_cached = None
+-        self._sin_cached = None
+-        self._cos_cached_total = None
+-        self._sin_cached_total = None
+-        self._cos_k_cached = None
+-        self._sin_k_cached = None
+-        self.scaling_factor = scaling_factor
+-        self._ntk_alpha_cached = 1.0
+-        self.position_ids_offset = []
+-        self.pos_lens = None
+-        self.ntk_inv_freqs = None
+-        self.position_ids_expanded = None
+-        self._batch_seq_len_cached = []
+-        self._batch_ntk_alpha_cached = []
+-        self._global_seq_len_cached = {}
+-        self._global_ntk_alpha_cached = {}
+-        self._table_size = 0
+-
+-    @classmethod
+-    def static(cls, dim: int, base: float, device: torch.device, scaling_factor: float = 1.0):
+-        """
+-        Factory method to create an embedding with computed inverse frequencies.
+-
+-        Args:
+-            dim: Dimension of the rotary embedding.
+-            base: Base value for frequency calculation.
+-            device: The device to create tensors on.
+-            scaling_factor: Scaling factor for positions.
+-
+-        Returns:
+-            Initialized PositionRotaryEmbedding instance
+-        """
+-
+-        inv_freq = 1.0 / (
+-                base
+-                ** (torch.arange(0, dim, 2, device=device, dtype=torch.double) / dim)
+-        ).to(torch.float)
+-        return cls(inv_freq, scaling_factor, base)
+-
+-    def update_cos_sin_cache_total(self, dtype: torch.dtype, device: torch.device, seqlen: int) -> None:
+-        """Update full-dim RoPE with concatenated frequency doubling (standard variant)."""
+-        self._update_cos_sin_cache_total(dtype, device, seqlen, duplication_mode="concat")
+-
+-    def get_cos_cached_total(self) -> torch.Tensor:
+-        """Return cached full-dimension cosine table."""
+-        return self._cos_cached_total
+-
+-    def get_sin_cached_total(self) -> torch.Tensor:
+-        """Return cached full-dimension sine table."""
+-        return self._sin_cached_total
+-
+-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+-        raise NotImplementedError
+-
+-    def _update_cos_sin_cache_total(
+-            self, dtype: torch.dtype, device: torch.device,
+-            seqlen: int, duplication_mode: str = "concat") -> None:
+-        """
+-        Update full-dimension cosine and sine caches for RoPE.
+-
+-        Args:
+-            dtype: Target dtype (e.g., torch.float16).
+-            device: Target device (e.g., 'npu:0').
+-            seqlen: Required sequence length.
+-            duplication_mode (str): Frequency duplication strategy:
+-                - "concat": emb = torch.cat((freqs, freqs), dim=-1) → [f0,f1,...,f0,f1,...]
+-                - "repeat": emb = torch.repeat_interleave(freqs, 2, dim=-1) → [f0,f0,f1,f1,...]
+-        """
+-
+-        # Use the same cache variables (both functions write to _cos/sin_cached_total)
+-        if (
+-                seqlen > self._seq_len_cached
+-                or self._cos_cached_total.device != device
+-                or self._cos_cached_total.dtype != dtype
+-        ):
+-            self._seq_len_cached = seqlen
+-            t = torch.arange(seqlen, device=device, dtype=self.inv_freq.dtype)
+-
+-            # Note: Cohere version skips the scaling_factor == 0 check;
+-            # we keep it for safety unless explicitly disabled.
+-            if hasattr(self, 'scaling_factor') and math.isclose(self.scaling_factor, 0.0):
+-                raise ValueError(
+-                    "PositionRotaryEmbedding scaling_factor cannot be 0. "
+-                    "It is recommended to be >= 1.0. See README.md for rope config guidance."
+-                )
+-            t = t / self.scaling_factor
+-            freqs = torch.outer(t, self.inv_freq.to(device=t.device))
+-
+-            if duplication_mode == "concat":
+-                emb = torch.cat((freqs, freqs), dim=-1)
+-            elif duplication_mode == "repeat":
+-                emb = torch.repeat_interleave(freqs, 2, dim=-1)
+-            else:
+-                raise ValueError(f"Unsupported duplication_mode: {duplication_mode}")
+-
+-            self._cos_cached_total = torch.cos(emb).to(dtype)
+-            self._sin_cached_total = torch.sin(emb).to(dtype)
+\ No newline at end of file
+diff --git a/mindie_llm/runtime/layers/embedding/rotary_embedding/__init__.py b/mindie_llm/runtime/layers/embedding/rotary_embedding/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7220191083e456f3c0dfbfc08173e681003552b
+--- /dev/null
++++ b/mindie_llm/runtime/layers/embedding/rotary_embedding/__init__.py
+@@ -0,0 +1,235 @@
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-License-Identifier: Apache-2.0
++# Part of this file implemented based on vllm project.
++# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
++# MindIE is licensed under Mulan PSL v2.
++# You can use this software according to the terms and conditions of the Mulan PSL v2.
++# You may obtain a copy of Mulan PSL v2 at:
++#          http://license.coscl.org.cn/MulanPSL2
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
++# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
++# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
++# See the Mulan PSL v2 for more details.
++
++import torch
++import torch_npu
++
++from mindie_llm.utils.log.logging import logger
++from mindie_llm.runtime.config.huggingface_config import BaseRopeScaling
++
++from .base import RotaryEmbedding
++from .registry import (
++    cached_rope_factory,
++    get_registered_rope_types,
++    get_rope_factory,
++    register_rope_type,
++)
++from .yarn_scaling_rope import YarnScalingRotaryEmbedding
++from .deepseek_v3_yarn_scaling_rope import DeepseekV3YarnRotaryEmbedding
++
++
++@register_rope_type("default")
++@cached_rope_factory
++def _create_default_rope(
++    head_size: int,
++    rotary_dim: int,
++    max_position: int,
++    base: float,
++    is_neox_style: bool,
++    dtype: torch.dtype,
++) -> RotaryEmbedding:
++    """Factory function for creating the default RotaryEmbedding implementation.
++
++    This implementation follows the original RoPE formulation without scaling extensions.
++
++    Args:
++        head_size: Dimension of each attention head.
++        rotary_dim: Dimensionality of the rotary embedding subspace.
++        max_position: Maximum sequence length supported by the embedding.
++        base: Base value for frequency computation (theta).
++        is_neox_style: Whether to use NeoX-style interleaved rotation (default: True).
++        dtype: Data type for embedding tensors (e.g., torch.float16, torch.bfloat16).
++
++    Returns:
++        Initialized RotaryEmbedding instance.
++    """
++    
++    return RotaryEmbedding(
++        head_size,
++        rotary_dim,
++        max_position,
++        base,
++        is_neox_style,
++        dtype,
++    )
++
++
++@register_rope_type("yarn")
++@cached_rope_factory
++def _create_yarn_rope(
++    head_size: int,
++    rotary_dim: int,
++    max_position: int,
++    base: float,
++    is_neox_style: bool,
++    dtype: torch.dtype,
++    rope_config: BaseRopeScaling,
++) -> RotaryEmbedding:
++    """Factory function for creating YaRN-scaled RotaryEmbedding.
++
++    Implements YaRN (Yet another RoPE extensioN) scaling with configurable parameters
++    for extrapolation control and attention scaling.
++
++    Args:
++    head_size: Dimension of each attention head.
++        rotary_dim: Dimensionality of the rotary embedding subspace.
++        max_position: Target maximum sequence length after scaling.
++        base: Base value for frequency computation (theta).
++        is_neox_style: Whether to use NeoX-style interleaved rotation.
++        dtype: Data type for embedding tensors.
++        rope_config: Configuration object containing YaRN-specific parameters:
++            - original_max_position_embeddings: Original context length before scaling
++            - factor: Scaling factor (>1.0 for context extension)
++            - extrapolation_factor: Controls extrapolation behavior
++            - beta_fast/beta_slow: YaRN attention window parameters
++            - mscale: Magnitude scaling factor
++            - apply_yarn_scaling: Whether to apply YaRN-specific modifications
++            - truncate: Whether to truncate frequencies beyond original context
++
++    Returns:
++        Initialized YarnScalingRotaryEmbedding instance.
++    """
++    original_max_position = getattr(rope_config, 'original_max_position_embeddings', max_position)
++    return YarnScalingRotaryEmbedding(
++        head_size,
++        rotary_dim,
++        original_max_position,
++        base,
++        is_neox_style,
++        dtype,
++        factor=getattr(rope_config, 'factor', 1.0),
++        extrapolation_factor=getattr(rope_config, 'extrapolation_factor', 1.0),
++        beta_fast=getattr(rope_config, 'beta_fast', 32),
++        beta_slow=getattr(rope_config, 'beta_slow', 1),
++        mscale=getattr(rope_config, 'mscale', 1.0),
++        apply_yarn_scaling=getattr(rope_config, 'apply_yarn_scaling', True),
++        truncate=getattr(rope_config, 'truncate', True),
++    )
++
++
++@register_rope_type("deepseek_yarn")
++@cached_rope_factory
++def _create_deepseek_scaling_rope(
++    head_size: int,
++    rotary_dim: int,
++    max_position: int,
++    base: float,
++    is_neox_style: bool,
++    dtype: torch.dtype,
++    rope_config: BaseRopeScaling,
++) -> RotaryEmbedding:
++    """Factory function for creating DeepSeek-V3 YaRN-scaled RotaryEmbedding.
++
++    Specialized implementation for DeepSeek-V3 architecture with YaRN scaling
++    and DeepSeek-specific parameters like mscale_all_dim.
++
++    Args:
++        head_size: Dimension of each attention head.
++        rotary_dim: Dimensionality of the rotary embedding subspace.
++        max_position: Target maximum sequence length after scaling.
++        base: Base value for frequency computation (theta).
++        is_neox_style: Whether to use NeoX-style interleaved rotation.
++        dtype: Data type for embedding tensors.
++        rope_config: Configuration object containing DeepSeek-specific parameters:
++            - original_max_position_embeddings: Original context length before scaling
++            - factor: Scaling factor for context extension
++            - beta_fast/beta_slow: YaRN attention window parameters
++            - mscale: Magnitude scaling factor
++            - mscale_all_dim: DeepSeek-specific magnitude scaling dimension parameter
++
++    Returns:
++        Initialized DeepseekV3YarnRotaryEmbedding instance.
++    """
++    original_max_position = getattr(rope_config, 'original_max_position_embeddings', max_position)
++    return DeepseekV3YarnRotaryEmbedding(
++        rotary_dim,
++        original_max_position,
++        base,
++        is_neox_style=is_neox_style,
++        dtype=dtype,
++        factor=getattr(rope_config, 'factor', 1.0),
++        beta_fast=getattr(rope_config, 'beta_fast', 32),
++        beta_slow=getattr(rope_config, 'beta_slow', 1),
++        mscale=getattr(rope_config, 'mscale', 1.0),
++        mscale_all_dim=getattr(rope_config, 'mscale_all_dim', None),
++    )
++
++
++def get_rope(
++    head_size: int,
++    rotary_dim: int,
++    max_position: int,
++    rope_config: BaseRopeScaling,
++    is_neox_style: bool = True,
++    dtype: torch.dtype | None = None,
++) -> RotaryEmbedding:
++    """Retrieve or create a RotaryEmbedding instance with automatic caching.
++
++    This function serves as the main entry point for RoPE instantiation:
++        1. Selects the appropriate implementation based on rope_config.rope_type
++        2. Applies partial rotary embedding if partial_rotary_factor < 1.0
++        3. Leverages factory registration and caching mechanisms for efficiency
++        4. Handles unknown rope types with informative error messages
++
++    Args:
++        head_size: Dimension of each attention head.
++        rotary_dim: Base dimensionality of the rotary embedding subspace.
++        max_position: Target maximum sequence length after scaling.
++        rope_config: Configuration object containing RoPE parameters including:
++            - rope_type: Identifier for RoPE variant ('default', 'yarn', etc.)
++            - rope_theta: Base frequency value
++            - original_max_position_embeddings: Original context length
++            - partial_rotary_factor: Fraction of dimensions to apply rotation to
++            - Additional variant-specific parameters (e.g., YaRN parameters)
++        is_neox_style: Whether to use NeoX-style interleaved rotation (default: True).
++        dtype: Data type for embedding tensors. If None, uses torch.get_default_dtype().
++
++    Returns:
++        Cached or newly created RotaryEmbedding instance matching the configuration.
++
++    Raises:
++        ValueError: If the specified rope_type is not registered.
++
++    Example:
++        >>> config = Qwen2RopeScaling(rope_type="yarn", factor=2.0, ...)
++        >>> rope = get_rope(128, 128, 8192, config, dtype=torch.bfloat16)
++    """
++    if dtype is None:
++        dtype = torch.get_default_dtype()
++    
++    rope_type = getattr(rope_config, 'rope_type', 'default')
++    base = rope_config.rope_theta
++    
++    factory_func = get_rope_factory(rope_type)
++    
++    if factory_func is None:
++        _msg = (
++            f"Unknown RoPE scaling type '{rope_type}'. "
++            f"Available types: {', '.join(get_registered_rope_types())}"
++        )
++        logger.error(_msg)
++        raise ValueError(_msg)
++
++    partial_rotary_factor = getattr(rope_config, "partial_rotary_factor", 1.0)
++    if partial_rotary_factor < 1.0:
++        rotary_dim = int(rotary_dim * partial_rotary_factor)
++    
++    return factory_func(
++        head_size,
++        rotary_dim,
++        max_position,
++        base,
++        is_neox_style,
++        dtype,
++        rope_config,
++    )
+diff --git a/mindie_llm/runtime/layers/embedding/rotary_embedding/base.py b/mindie_llm/runtime/layers/embedding/rotary_embedding/base.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e442ba1053cfb82e886b8b256cb0f3e2631dbeee
+--- /dev/null
++++ b/mindie_llm/runtime/layers/embedding/rotary_embedding/base.py
+@@ -0,0 +1,174 @@
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-License-Identifier: Apache-2.0
++# Part of this file implemented based on vllm project.
++# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
++# MindIE is licensed under Mulan PSL v2.
++# You can use this software according to the terms and conditions of the Mulan PSL v2.
++# You may obtain a copy of Mulan PSL v2 at:
++#          http://license.coscl.org.cn/MulanPSL2
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
++# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
++# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
++# See the Mulan PSL v2 for more details.
++
++import torch
++import torch.nn as nn
++import torch_npu
++
++from mindie_llm.utils.log.logging import logger
++
++
++class RotaryEmbedding(nn.Module):
++    """Base class for Rotary Positional Embedding (RoPE) with NPU acceleration support.
++
++    This module precomputes cosine and sine caches for rotary position embeddings
++    and applies them to query and key tensors during the forward pass using an
++    optimized NPU kernel (`torch_npu._npu_rotary_embedding`).
++
++    Supports both full and partial rotary embedding (via `rotary_dim < head_size`)
++    and both Neox-style (LLaMA) and GPT-J-style interleaved rotation.
++
++    Buffers:
++        cos_cache: Precomputed cosine values of shape `[max_position_embeddings, rotary_dim // 2]`.
++        sin_cache: Precomputed sine values of shape `[max_position_embeddings, rotary_dim // 2]`.
++
++    Note:
++        All caches are registered as non-persistent buffers to avoid saving them in checkpoints.
++    """
++    def __init__(
++        self,
++        head_size: int,
++        rotary_dim: int,
++        max_position_embeddings: int,
++        base: float,
++        is_neox_style: bool = True,
++        dtype=None
++    ) -> None:
++        """Initialize the RotaryEmbedding module.
++
++        Args:
++            head_size: Dimension of each attention head.
++            rotary_dim: Number of dimensions to apply RoPE on. Must be <= head_size.
++                        If less than head_size, only the first `rotary_dim` dimensions are rotated.
++            max_position_embeddings: Maximum sequence length supported. Determines cache size.
++            base: Base value for frequency computation (e.g., 10000.0).
++            is_neox_style: If True, uses Neox-style (chunked) rotation.
++                           If False, uses GPT-J-style (interleaved) rotation.
++            dtype: Data type for internal caches (e.g., torch.float16, torch.bfloat16).
++            device: device for rope module
++        """
++        super().__init__()
++        self.head_size = head_size
++        self.rotary_dim = rotary_dim
++        self.max_position_embeddings = max_position_embeddings
++        self.base = base
++        self.is_neox_style = is_neox_style
++        self.dtype = dtype if dtype else torch.get_default_dtype()
++
++        self._compute_inv_freq()
++        self._compute_cos_sin_cache()
++
++    def get_cos_sin_for_positions(self, positions) -> tuple[torch.Tensor, torch.Tensor]:
++        cos = torch.index_select(self.cos_cache, dim=0, index=positions)
++        sin = torch.index_select(self.sin_cache, dim=0, index=positions)
++        
++        return cos, sin # [q_len, rotary_dim // 2]
++    
++    def set_cos_sin_indexed_cache(self, positions) -> None:
++        """Create position-indexed cosine/sine caches with dimension doubling.
++
++        Extracts position-specific rotary values from precomputed caches and
++        duplicates them across the last dimension to match attention head layout.
++
++        Args:
++            postions: 1D tensor of position indices to index into the cache.
++        """
++        cos = torch.index_select(self.cos_cache, dim=0, index=positions)
++        sin = torch.index_select(self.sin_cache, dim=0, index=positions)
++        cos_indexed_cache = cos.repeat(1, 2).view(1, -1, 1, self.head_size).contiguous()
++        sin_indexed_cache = sin.repeat(1, 2).view(1, -1, 1, self.head_size).contiguous()
++        self.register_buffer("cos_indexed_cache", cos_indexed_cache, persistent=False) # [seq_len, 1, 1, rotary_dim]
++        self.register_buffer("sin_indexed_cache", sin_indexed_cache, persistent=False)
++
++    def forward(
++        self,
++        positions: torch.Tensor,
++        query: torch.Tensor,
++        key: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Apply rotary positional embedding to query and key tensors.
++
++        Uses the Ascend NPU-optimized kernel `torch_npu.npu_apply_rotary_pos_emb` for high performance.
++
++        Args:
++            positions: Position indices, shape `[num_tokens]`.
++            query: Query tensor, shape `[num_tokens, num_heads * head_size]`.
++            key: Key tensor, shape `[num_tokens, num_kv_heads * head_size]`.
++
++        Returns:
++            A tuple of (rotated_query, rotated_key) with same shapes as inputs.
++        """
++        query_shape = query.shape
++        key_shape = key.shape
++        cos = self.cos_indexed_cache
++        sin = self.sin_indexed_cache
++        if self._npu_apply_rotary_pos_emb_support():
++            # If cos and sin are generated outside, use npu_apply_rotary_pos_emb to avoid redundant calculation.
++            # This method requires head_size and rotary_dim equal 128 and neox_style is True
++            query = query.contiguous().view(1, query_shape[0], -1,
++                                            self.head_size) # [1, B*S, N_head, D]
++            key = key.contiguous().view(1, key_shape[0], -1,
++                                            self.head_size) # [1, B*S, N_head, D]
++            # Although this function modifies in-place, please retain the function's return value.
++            # Otherwise, the graph fusion operation may fail.
++            
++            query, key = torch_npu.npu_apply_rotary_pos_emb(
++                query, key, cos, sin)
++            return query, key
++        else:
++            _msg = ("This method requires head_size and rotary_dim equal 128 and neox_style is True. "
++                    f"{self.is_neox_style=}, "
++                    f"{self.head_size=}, "
++                    f"{self.cos_indexed_cache.shape[-1]=}, "
++                    f"{self.sin_indexed_cache.shape[-1]=}.")
++            logger.error(_msg)
++            raise ValueError(_msg)
++
++    def _npu_apply_rotary_pos_emb_support(self) -> bool:
++        return (
++            self.is_neox_style
++            and self.head_size == 128
++            and self.cos_indexed_cache.shape[-1] == 128
++            and self.sin_indexed_cache.shape[-1] == 128
++        )
++
++    def _compute_inv_freq(self):
++        """Compute inverse frequencies for RoPE.
++
++        Returns:
++            inv_freq: Tensor of shape `[rotary_dim // 2]` containing 1 / (base^(i / rotary_dim)).
++        """
++        inv_freq = 1.0 / (
++            self.base
++            ** (
++                torch.arange(0, self.rotary_dim, 2).to(torch.float32) / self.rotary_dim
++            )
++        )
++        self.register_buffer("inv_freq", inv_freq, persistent=False) # [rotary_dim // 2, ]
++
++    def _compute_cos_sin_cache(self) -> None:
++        """Precompute cosine, sine, and concatenated caches for all positions.
++
++        The frequency matrix is computed as `freqs[i, j] = t[i] * inv_freq[j]`,
++        where `t` is the position index and `inv_freq` is the inverse frequency.
++
++        The shape of three tensors:
++            - cos: Cosine values, shape `[max_position_embeddings, rotary_dim // 2]`
++            - sin: Sine values, shape `[max_position_embeddings, rotary_dim // 2]`
++        """
++        t = torch.arange(self.max_position_embeddings).to(torch.float32) # [max_position_embeddings, ]
++        freqs = torch.einsum("i,j -> ij", t, self.inv_freq)
++        cos = freqs.cos().to(self.dtype)
++        sin = freqs.sin().to(self.dtype)
++        self.register_buffer("cos_cache", cos, persistent=False) # [max_position_embeddings, rotary_dim // 2]
++        self.register_buffer("sin_cache", sin, persistent=False) # [max_position_embeddings, rotary_dim // 2]
+diff --git a/mindie_llm/runtime/layers/embedding/rotary_embedding/deepseek_v3_yarn_scaling_rope.py b/mindie_llm/runtime/layers/embedding/rotary_embedding/deepseek_v3_yarn_scaling_rope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..37aab2b2a340a4f5efebefc48ec3115c3f0cd468
+--- /dev/null
++++ b/mindie_llm/runtime/layers/embedding/rotary_embedding/deepseek_v3_yarn_scaling_rope.py
+@@ -0,0 +1,99 @@
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-License-Identifier: Apache-2.0
++# Part of this file implemented based on vllm project.
++# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
++# MindIE is licensed under Mulan PSL v2.
++# You can use this software according to the terms and conditions of the Mulan PSL v2.
++# You may obtain a copy of Mulan PSL v2 at:
++#          http://license.coscl.org.cn/MulanPSL2
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
++# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
++# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
++# See the Mulan PSL v2 for more details.
++
++import torch
++import torch_npu
++
++from mindie_llm.runtime.layers.embedding.rotary_embedding.yarn_scaling_rope import (
++    YarnScalingRotaryEmbedding,
++    yarn_get_mscale
++)
++
++
++class DeepseekV3YarnRotaryEmbedding(YarnScalingRotaryEmbedding):
++    """DeepSeek-V3 specialized YaRN rotary embedding with mscale_all_dim scaling.
++
++    Extends standard YaRN scaling with DeepSeek-V3's additional magnitude scaling
++    parameter (mscale_all_dim) for fine-grained attention magnitude control.
++    """
++    def __init__(
++        self,
++        dim,
++        original_max_position_embeddings=4096,
++        base=10000,
++        factor=1.0,
++        beta_fast=32,
++        beta_slow=1,
++        is_neox_style=True,
++        dtype=None,
++        mscale=1.0,
++        mscale_all_dim=1.0,
++    ) -> None:
++        """Initialize DeepSeek-V3 YaRN rotary embedding.
++
++        Args:
++            dim: Rotary embedding dimension (applied to both head and rotary dims).
++            original_max_position_embeddings: Original context length before scaling.
++            base: Base frequency for rotary embedding (theta).
++            factor: Context extension scaling factor (>1.0 for extrapolation).
++            beta_fast: YaRN fast decay window parameter.
++            beta_slow: YaRN slow decay window parameter.
++            is_neox_style: Use NeoX-style interleaved rotation (default: True).
++            dtype: Data type for embedding tensors (e.g., torch.float16).
++            mscale: Base magnitude scaling factor for attention preservation.
++            mscale_all_dim: DeepSeek-V3 specific scaling factor applied across all dimensions.
++        """
++        self.mscale_all_dim = mscale_all_dim
++        super().__init__(dim, dim, original_max_position_embeddings, base,
++        dtype=dtype,
++            is_neox_style=is_neox_style,
++            factor=factor,
++            beta_fast=beta_fast,
++            beta_slow=beta_slow,
++            mscale=mscale
++        )
++    
++    def set_cos_sin_indexed_cache(self, postions) -> None:
++        """Create position-indexed cosine/sine caches with dimension doubling.
++
++        Extracts position-specific rotary values from precomputed caches and
++        duplicates them across the last dimension to match attention head layout.
++
++        Args:
++            postions: 1D tensor of position indices to index into the cache.
++        """
++        cos_indexed_cache = torch.index_select(self.cos_cache, dim=0, index=postions.view(-1)).unsqueeze(1).unsqueeze(1)
++        sin_indexed_cache = torch.index_select(self.sin_cache, dim=0, index=postions.view(-1)).unsqueeze(1).unsqueeze(1) 
++        cos_indexed_cache = torch.cat((cos_indexed_cache, cos_indexed_cache), dim=-1)
++        sin_indexed_cache = torch.cat((sin_indexed_cache, sin_indexed_cache), dim=-1)
++        self.register_buffer("cos_indexed_cache", cos_indexed_cache, persistent=False) # [seq_len, 1, 1, rotary_dim]
++        self.register_buffer("sin_indexed_cache", sin_indexed_cache, persistent=False)
++
++    def _compute_cos_sin_cache(self) -> None:
++        """Precompute cosine/sine caches with DeepSeek-V3 specific magnitude scaling.
++
++        Applies dual scaling factors (mscale and mscale_all_dim) to preserve attention
++        magnitude during context extrapolation. The effective scale is mscale/mscale_all_dim.
++        """
++        t = torch.arange(
++            self.max_position_embeddings
++        ).to(torch.float32)
++        freqs = torch.einsum("i,j -> ij", t, self.inv_freq)
++        _mscale = float(
++            yarn_get_mscale(self.scaling_factor, self.mscale)
++            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
++        )
++        cos = freqs.cos().to(self.dtype) * _mscale
++        sin = freqs.sin().to(self.dtype) * _mscale
++        self.register_buffer("cos_cache", cos, persistent=False) # [max_position_embeddings, rotary_dim // 2]
++        self.register_buffer("sin_cache", sin, persistent=False) # [max_position_embeddings, rotary_dim // 2]
+diff --git a/mindie_llm/runtime/layers/embedding/rotary_embedding/registry.py b/mindie_llm/runtime/layers/embedding/rotary_embedding/registry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2920cc92803ba90b22fe2aba191d3af66ef5ca9a
+--- /dev/null
++++ b/mindie_llm/runtime/layers/embedding/rotary_embedding/registry.py
+@@ -0,0 +1,199 @@
++# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
++# MindIE is licensed under Mulan PSL v2.
++# You can use this software according to the terms and conditions of the Mulan PSL v2.
++# You may obtain a copy of Mulan PSL v2 at:
++#          http://license.coscl.org.cn/MulanPSL2
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
++# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
++# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
++# See the Mulan PSL v2 for more details.
++
++from functools import wraps
++from typing import Any, Callable
++from dataclasses import asdict
++
++import torch
++import torch_npu
++
++from mindie_llm.runtime.config.huggingface_config import BaseRopeScaling
++from .base import RotaryEmbedding
++
++
++# Global cache dictionary for RoPE instances.
++# Key: tuple of (head_size, rotary_dim, max_position, is_neox_style, rope_parameters_tuple, dtype)
++# Value: Cached RotaryEmbedding instance
++_ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
++
++# Registry mapping rope_type strings to factory functions.
++# Key: rope_type identifier (e.g., 'dynamic', 'yarn')
++# Value: Factory function with signature:
++#   (head_size: int, rotary_dim: int, max_position: int, base: float,
++#    is_neox_style: bool, dtype: torch.dtype, rope_config: BaseRopeScaling) -> RotaryEmbedding
++_ROPE_REGISTRY: dict[str, Callable] = {}
++
++
++def register_rope_type(rope_type: str) -> Callable:
++    """Decorator to register a RoPE implementation factory function.
++
++    Factory functions must accept the following parameters:
++        head_size: int
++        rotary_dim: int
++        max_position: int
++        base: float
++        is_neox_style: bool
++        dtype: torch.dtype
++        rope_config: BaseRopeScaling
++
++    And return a RotaryEmbedding instance.
++
++    Args:
++        rope_type: Unique identifier for the RoPE variant (e.g., 'dynamic', 'yarn').
++
++    Returns:
++        The original factory function, now registered in _ROPE_REGISTRY.
++
++    Raises:
++        ValueError: If the rope_type is already registered.
++    """
++    def decorator(factory_func: Callable) -> Callable:
++        if rope_type in _ROPE_REGISTRY:
++            raise ValueError(
++                f"RoPE type '{rope_type}' is already registered. "
++                f"Use a different name or unregister the existing one."
++            )
++        _ROPE_REGISTRY[rope_type] = factory_func
++        return factory_func
++    return decorator
++
++
++def unregister_rope_type(rope_type: str) -> None:
++    """Unregister a RoPE implementation factory function.
++
++    Args:
++        rope_type: Identifier of the RoPE variant to remove from registry.
++
++    Note:
++        No exception is raised if the rope_type is not currently registered.
++    """
++    if rope_type in _ROPE_REGISTRY:
++        del _ROPE_REGISTRY[rope_type]
++
++
++def get_registered_rope_types() -> list[str]:
++    """Retrieve a list of all registered RoPE type identifiers.
++
++    Returns:
++        List of registered rope_type strings (e.g., ['default', 'dynamic', 'yarn']).
++    """
++    return list(_ROPE_REGISTRY.keys())
++
++
++def cached_rope_factory(factory_func: Callable) -> Callable:
++    """Decorator that adds caching to a RoPE factory function.
++
++    Caches RotaryEmbedding instances based on a composite key derived from:
++        - head_size
++        - rotary_dim (adjusted by partial_rotary_factor if present)
++        - max_position
++        - is_neox_style
++        - rope_config parameters (converted to hashable tuple)
++        - dtype
++    
++    Automatically handles:
++        - partial_rotary_factor adjustment to rotary_dim
++        - Conversion of BaseRopeScaling to hashable format
++        - Conditional argument passing based on rope_type ('default' vs others)
++
++    Args:
++        factory_func: RoPE factory function to wrap. Must return a RotaryEmbedding instance.
++
++    Returns:
++        Wrapped factory function with integrated caching logic.
++
++    """
++    @wraps(factory_func)
++    def wrapper(
++        head_size: int,
++        rotary_dim: int,
++        max_position: int,
++        base: float,
++        is_neox_style: bool,
++        dtype: torch.dtype,
++        rope_config: BaseRopeScaling,
++    ) -> RotaryEmbedding:
++        # Convert BaseRopeScaling to hashable format for cache key
++        rope_parameters_tuple = {
++            k: tuple(v) if isinstance(v, list) else v
++            for k, v in asdict(rope_config).items()
++        }
++        rope_parameters_args = tuple(rope_parameters_tuple.items())
++        
++        # Construct composite cache key
++        key = (
++            head_size,
++            rotary_dim,
++            max_position,
++            is_neox_style,
++            rope_parameters_args,
++            dtype,
++        )
++        
++        # Return cached instance if available
++        if key in _ROPE_DICT:
++            return _ROPE_DICT[key]
++        
++        # Create new instance with appropriate arguments
++        if rope_config.rope_type != "default":
++            rotary_emb = factory_func(
++                head_size,
++                rotary_dim,
++                max_position,
++                base,
++                is_neox_style,
++                dtype,
++                rope_config,
++            )
++        else:
++            # 'default' RoPE implementations typically don't require rope_config
++            rotary_emb = factory_func(
++                head_size,
++                rotary_dim,
++                max_position,
++                base,
++                is_neox_style,
++                dtype,
++            )
++        
++        # Cache and return the new instance
++        _ROPE_DICT[key] = rotary_emb
++        return rotary_emb
++    
++    return wrapper
++
++
++def clear_rope_cache() -> None:
++    """Clear all cached RoPE instances.
++
++    Use this when:
++        - Model configuration changes dynamically
++        - Memory pressure requires cache eviction
++        - Testing different RoPE configurations in the same runtime
++    """
++    _ROPE_DICT.clear()
++
++
++def get_rope_factory(rope_type: str) -> Callable | None:
++    """Retrieve the factory function for a registered RoPE type.
++
++    Args:
++        rope_type: Identifier of the desired RoPE variant.
++
++    Returns:
++        Factory function if registered, otherwise None.
++
++    Example:
++        factory = get_rope_factory("dynamic")
++        if factory:
++            rope = factory(head_size, rotary_dim, ...)
++    """
++    return _ROPE_REGISTRY.get(rope_type)
+diff --git a/mindie_llm/runtime/layers/embedding/rotary_embedding/yarn_scaling_rope.py b/mindie_llm/runtime/layers/embedding/rotary_embedding/yarn_scaling_rope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3326580a55a6f95650a779dfb527526ea294d382
+--- /dev/null
++++ b/mindie_llm/runtime/layers/embedding/rotary_embedding/yarn_scaling_rope.py
+@@ -0,0 +1,204 @@
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++# SPDX-License-Identifier: MIT
++#
++# Copyright 2023 The vLLM team.
++# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
++#
++# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
++# and OPT implementations in this library. It has been modified from its
++# original forms to accommodate minor architectural differences compared
++# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# Implement part of this file based on aiter.
++# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
++# MindIE is licensed under Mulan PSL v2.
++# You can use this software according to the terms and conditions of the Mulan PSL v2.
++# You may obtain a copy of Mulan PSL v2 at:
++#          http://license.coscl.org.cn/MulanPSL2
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
++# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
++# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
++# See the Mulan PSL v2 for more details.
++
++import math
++
++import torch
++
++from .base import RotaryEmbedding
++
++
++def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0):
++    """Compute YaRN magnitude scaling factor."""
++    if scale <= 1:
++        return 1.0
++    return 0.1 * mscale * math.log(scale) + 1.0
++
++
++def yarn_find_correction_dim(
++    num_rotations: int,
++    dim: int,
++    base: float = 10000,
++    max_position_embeddings: int = 2048,
++) -> float:
++    """Compute dimension index for given number of rotations."""
++    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
++        2 * math.log(base)
++    )
++
++
++def yarn_find_correction_range(
++    low_rot: int,
++    high_rot: int,
++    dim: int,
++    base: float = 10000,
++    max_position_embeddings: int = 2048,
++    truncate: bool = True,
++) -> tuple[float | int, float | int]:
++    """Compute [low, high] dimension range for frequency blending."""
++    low = yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
++    high = yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
++    if truncate:
++        low = math.floor(low)
++        high = math.ceil(high)
++    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
++
++
++def yarn_linear_ramp_mask(
++    low: float, high: float, dim: int, dtype: torch.dtype = torch.float32
++) -> torch.Tensor:
++    """Linear ramp mask from 1 (at low) to 0 (at high)."""
++    if low == high:
++        high += 0.001  # Prevent singularity
++
++    linear_func = (torch.arange(dim, dtype=dtype) - low) / (high - low)
++    ramp_func = torch.clamp(linear_func, 0, 1)
++    return ramp_func
++
++
++class YarnScalingRotaryEmbedding(RotaryEmbedding):
++    """YaRN (Yet another RoPE extensioN) rotary embedding with context scaling.
++
++    Extends standard RoPE to support long-context inference by blending interpolated
++    and extrapolated frequency components, along with attention magnitude scaling.
++    Based on the method proposed by Peng et al. (https://github.com/jquesnelle/yarn).
++
++    Key features:
++      - Smooth transition between interpolation (low frequencies) and extrapolation (high frequencies)
++      - Attention magnitude compensation via `mscale`
++      - Configurable correction boundaries via `beta_fast` and `beta_slow`
++
++    Inherits from `RotaryEmbedding` and overrides cache computation to support scaled context.
++    """
++    def __init__(
++        self,
++        head_size: int,
++        rotary_dim: int,
++        original_max_position_embeddings: int,
++        base: float,
++        is_neox_style: bool,
++        dtype: torch.dtype = None,
++        *,
++        factor=1,
++        extrapolation_factor: float = 1,
++        attention_factor: float = 1,
++        beta_fast: int = 32,
++        beta_slow: int = 1,
++        apply_yarn_scaling: bool = True,
++        truncate: bool = True,
++        mscale: float | None = 1.0
++    ) -> None:
++        """Initialize YaRN rotary embedding.
++
++        Args:
++            head_size: Dimension of each attention head.
++            rotary_dim: Number of dimensions to apply RoPE on.
++            original_max_position_embeddings: Original maximum sequence length used during pretraining.
++            base: Base period for RoPE frequencies.
++            is_neox_style: Rotation style (Neox vs GPT-J).
++            dtype: Data type for internal caches.
++            factor: Context scaling factor (e.g., 2.0 extends context to 2x original length).
++            extrapolation_factor: Weight for extrapolated frequencies in the blend.
++            attention_factor: Base attention magnitude scaling factor.
++            beta_fast: Number of rotations for the high-frequency (extrapolation) boundary.
++            beta_slow: Number of rotations for the low-frequency (interpolation) boundary.
++            apply_yarn_scaling: Whether to apply the YaRN-specific magnitude scaling (`mscale`).
++            truncate: Whether to floor/ceil correction bounds to integer dimensions.
++        """
++        self.scaling_factor = factor
++        self.extrapolation_factor = extrapolation_factor
++        self.attention_factor = attention_factor
++        self.beta_fast = beta_fast
++        self.beta_slow = beta_slow
++        self.truncate = truncate
++        self.mscale = mscale if mscale else (
++            float(yarn_get_mscale(self.scaling_factor) * self.attention_factor)
++            if apply_yarn_scaling
++            else float(self.attention_factor)
++        )
++        self.original_max_position_embeddings = original_max_position_embeddings
++        max_position_embeddings = int(self.scaling_factor * original_max_position_embeddings)
++        super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype)
++
++    def _compute_inv_freq(self) -> None:
++        """Compute blended inverse frequencies for YaRN.
++
++        Combines interpolated frequencies (scaled by `factor`) and extrapolated frequencies
++        using a linear ramp mask that depends on `beta_fast` and `beta_slow`.
++
++        Returns:
++            inv_freq: Blended inverse frequencies of shape `[rotary_dim // 2]`.
++        """
++        pos_freqs = self.base ** (
++            torch.arange(0, self.rotary_dim, 2).to(torch.float32) / self.rotary_dim
++        )
++        inv_freq_extrapolation = 1.0 / pos_freqs
++        inv_freq_interpolation = 1.0 / (self.scaling_factor * pos_freqs)
++
++        low, high = yarn_find_correction_range(
++            self.beta_fast,
++            self.beta_slow,
++            self.rotary_dim,
++            self.base,
++            self.original_max_position_embeddings,
++            self.truncate,
++        )
++        # Get n-d rotational scaling corrected for extrapolation
++        inv_freq_mask = (
++            1
++            - yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=torch.float32)
++        ) * self.extrapolation_factor
++        inv_freq = (
++            inv_freq_interpolation * (1 - inv_freq_mask)
++            + inv_freq_extrapolation * inv_freq_mask
++        )
++        self.register_buffer("inv_freq", inv_freq, persistent=False)
++
++    def _compute_cos_sin_cache(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """Precompute cosine and sine caches for the extended context length.
++
++        The cache length is `max_position_embeddings`, and all values
++        are scaled by `mscale` to preserve attention magnitude.
++
++        Returns:
++            A tuple of (cos, sin, cos_sin) tensors, where:
++                - cos/sin: Shape `[max_position_embeddings, rotary_dim // 2]`
++        """
++        t = torch.arange(
++            self.max_position_embeddings
++        ).to(torch.float32)
++        freqs = torch.einsum("i,j -> ij", t, self.inv_freq)
++        cos = freqs.cos().to(self.dtype) * self.mscale
++        sin = freqs.sin().to(self.dtype) * self.mscale
++        self.register_buffer("cos_cache", cos, persistent=False) # [max_position_embeddings, rotary_dim // 2]
++        self.register_buffer("sin_cache", sin, persistent=False) # [max_position_embeddings, rotary_dim // 2]
+diff --git a/mindie_llm/runtime/model_runner/forward_context_exp.py b/mindie_llm/runtime/model_runner/forward_context_exp.py
+index 6cbe37e3497639aa7dc8d167f1736559ffd8642c..e47b70a59dbfdeff6637ca42454b011bdd0ebe79 100644
+--- a/mindie_llm/runtime/model_runner/forward_context_exp.py
++++ b/mindie_llm/runtime/model_runner/forward_context_exp.py
+@@ -132,8 +132,6 @@ def set_forward_context(context: ForwardContext) -> None:
+ # NOTE: This API will be refactored
+ def create_forward_context(
+     model_inputs: any,
+-    cos_table: torch.Tensor,
+-    sin_table: torch.Tensor,
+     mask: torch.Tensor,
+     num_speculative_tokens: int = 0
+ ) -> ForwardContext:
+@@ -141,8 +139,6 @@ def create_forward_context(
+     
+     Args:
+         model_inputs: Model input data.
+-        cos_table: Cosine table for rotary embedding.
+-        sin_table: Sine table for rotary embedding.
+         mask: Attention mask.
+         num_speculative_tokens: Number of speculative tokens.
+         
+@@ -154,7 +150,8 @@ def create_forward_context(
+     attn_backend = attn_layer.get_attn_backend()
+     metadata_cls = attn_backend.get_builder_cls().get_metadata_cls()
+     # NOTE: This API will be refactored
+-    attn_metadata = metadata_cls.from_model_input(model_inputs, cos_table, sin_table, mask, num_speculative_tokens)
++    attn_metadata = metadata_cls.from_model_input(model_inputs, mask, num_speculative_tokens)
++
+ 
+     dp_metadata = None
+     if DPMetadata.is_enabled():
+diff --git a/mindie_llm/runtime/model_runner/forward_metadata/attn_metadata.py b/mindie_llm/runtime/model_runner/forward_metadata/attn_metadata.py
+index 0d0196e90b851f1f97edfc5b3e7f479c41a3cf0b..fc65c9e21a9d4a4cb2ad4e76661e6b1c8a6d8ca1 100644
+--- a/mindie_llm/runtime/model_runner/forward_metadata/attn_metadata.py
++++ b/mindie_llm/runtime/model_runner/forward_metadata/attn_metadata.py
+@@ -34,7 +34,5 @@ class AttentionMetadata(ModuleMetadata):
+     seq_lens: torch.Tensor
+     block_tables: torch.Tensor
+     attn_mask: torch.Tensor
+-    cos_table: torch.Tensor
+-    sin_table: torch.Tensor
+     seq_lens_list: Optional[List[int]] = None
+     max_seq_len: int = 0
+diff --git a/mindie_llm/runtime/model_runner/model_runner.py b/mindie_llm/runtime/model_runner/model_runner.py
+index e50b1e34a87f7251d5f04ca23c56914724fd155a..f543ebd7fdbb1f3d72661ddf58ab1c6b10aa953a 100644
+--- a/mindie_llm/runtime/model_runner/model_runner.py
++++ b/mindie_llm/runtime/model_runner/model_runner.py
+@@ -20,7 +20,6 @@ import torch.nn.functional as F
+ from mindie_llm.runtime.utils.helpers.env import ENV
+ from mindie_llm.runtime.utils.cpu.affinity import bind_cpus
+ from mindie_llm.runtime.utils.npu.device_utils import get_npu_hbm_info
+-from mindie_llm.runtime.layers.embedding.position_rotary_embedding import PositionRotaryEmbedding
+ from mindie_llm.runtime.models import get_router_ins
+ from mindie_llm.runtime.model_runner.forward_context import create_forward_context, set_forward_context, \
+     get_forward_context, AttentionMetadata, BatchDescriptor
+@@ -145,9 +144,6 @@ class ModelRunner:
+         # NOTE: need to refactor
+         self.kv_cache_dtype = self.dtype if self.mindie_llm_config.quant_config.kv_quant_type is None else torch.int8
+         self.mask = None
+-        self.rotary_emb = None
+-        self.cos_table = None
+-        self.sin_table = None
+         
+         self.head_size = None
+         self.num_heads = None
+@@ -203,6 +199,11 @@ class ModelRunner:
+             os.environ["OMP_NUM_THREADS"] = "1"
+ 
+         # load model
++        if self.max_seq_len > self.mindie_llm_config.hf_config.max_position_embeddings:
++            _msg = f"`max_seq_len` cannot be larger than `max_position_embeddings`\
++                or `max_position_embeddings`*`scaling_factor` when scaling."
++            logger.error(_msg)
++            raise ValueError(_msg)
+         with set_default_torch_dtype(self.config.torch_dtype):
+             with self.device:
+                 self.model = self.model_cls(self.mindie_llm_config)
+@@ -210,22 +211,7 @@ class ModelRunner:
+         DefaultModelLoader().load_weights(self.model, self.model_name_or_path)
+         print_log(self.rank, logger.info, f"load weight done")
+ 
+-        # deepseek use qk_nope_head_dim, qwen use head_dim
+-        head_dim = self.config.head_dim if hasattr(self.config, 'head_dim') else self.config.qk_nope_head_dim
+-        self.rotary_emb = PositionRotaryEmbedding.static(dim=head_dim,
+-                                                         base=self.config.rope_theta,
+-                                                         device="cpu",
+-                                                         scaling_factor=self.config.rope_scaling.factor).to(self.device)
+-        self.rotary_emb.update_cos_sin_cache_total(
+-                self.dtype,
+-                self.device,
+-                self.max_position_embeddings
+-            )
+         self.mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).npu()
+-        
+-        self.cos_table = self.rotary_emb.get_cos_cached_total().npu()
+-        self.sin_table = self.rotary_emb.get_sin_cached_total().npu()
+-
+         if self.world_size > 1:
+             torch_dist.barrier()
+         self.head_size = self.mindie_llm_config.hf_config.head_dim
+@@ -402,8 +388,6 @@ class ModelRunner:
+             "seq_lens_list": seq_lens_list,
+             "q_lens": q_lens,
+             "lm_head_indices": lm_head_indices,
+-            "cos_table": self.cos_table,
+-            "sin_table": self.sin_table,
+             "actual_seq_lengths_kv": actual_seq_lengths_kv,
+             "actual_seq_lengths_query": actual_seq_lengths_query,
+             "num_tokens_across_dp_cpu": num_tokens_across_dp_cpu,
+@@ -589,8 +573,6 @@ class ModelRunner:
+             "lm_head_indices": lm_head_indices,
+             "num_tokens": num_tokens,
+             "num_actual_tokens": num_tokens,
+-            "cos_table": self.cos_table,
+-            "sin_table": self.sin_table,
+             "num_tokens_across_dp_cpu": num_tokens_across_dp_cpu,
+             "actual_seq_lengths_kv": actual_seq_lengths_kv,
+             "actual_seq_lengths_query": actual_seq_lengths_query,
+diff --git a/mindie_llm/runtime/model_runner/model_runner_exp.py b/mindie_llm/runtime/model_runner/model_runner_exp.py
+index cf74ad79f8b9b16b226186e71a6c101f9cda9253..30392515fcf918fbfb47bb05f918981e3c2a4fac 100644
+--- a/mindie_llm/runtime/model_runner/model_runner_exp.py
++++ b/mindie_llm/runtime/model_runner/model_runner_exp.py
+@@ -19,7 +19,6 @@ from mindie_llm.utils.env import ENV as ENV_utils
+ from mindie_llm.runtime.utils.helpers.env import ENV
+ from mindie_llm.runtime.utils.cpu.affinity import bind_cpus
+ from mindie_llm.runtime.utils.npu.device_utils import get_npu_hbm_info
+-from mindie_llm.runtime.layers.embedding.position_rotary_embedding import PositionRotaryEmbedding
+ from mindie_llm.runtime.models import get_router_ins
+ from mindie_llm.runtime.model_runner.forward_context_exp import create_forward_context, set_forward_context, \
+     get_forward_context, BatchDescriptor, ForwardContext
+@@ -118,6 +117,7 @@ class ModelRunnerExp:
+         self._max_num_token = self._max_batch_size
+         local_rank = local_rank if local_rank is not None else rank
+         self.device = set_device(rank, npu_id if npu_id is not None else local_rank)
++        self._max_seq_len = kwargs.get("max_seq_len", -1)
+ 
+         # bin cpus to the NUMA
+         if ENV.bind_cpu:
+@@ -178,9 +178,6 @@ class ModelRunnerExp:
+ 
+         # NOTE: default mask and rotary_emb will be refactored later.
+         self._mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).npu()
+-        self.rotary_emb = None
+-        self.cos_table = None
+-        self.sin_table = None
+ 
+         self._is_warmup_completed = False
+ 
+@@ -203,6 +200,13 @@ class ModelRunnerExp:
+             os.environ["OMP_NUM_THREADS"] = "1"
+ 
+         # load model
++        if self._max_seq_len > self._mindie_llm_config.hf_config.rope_scaling.max_position_embeddings:
++            _msg = (f"`max_seq_len` cannot be larger than `max_position_embeddings` "
++                "or `max_position_embeddings`*`scaling_factor` when scaling. "
++                f"max_seq_len={self._max_seq_len} but max_position_embeddings"
++                f"={self._mindie_llm_config.hf_config.rope_scaling.max_position_embeddings}")
++            logger.error(_msg)
++            raise ValueError(_msg)
+         with set_default_torch_dtype(self.config.torch_dtype):
+             with self.device:
+                 self.model = self._model_cls(self._mindie_llm_config)
+@@ -210,21 +214,6 @@ class ModelRunnerExp:
+         DefaultModelLoader().load_weights(self.model, self._model_name_or_path)
+         logger.info("Load weight done.")
+ 
+-        # NOTE: `PositionRotaryEmbedding` will be moved to model
+-        self.rotary_emb = PositionRotaryEmbedding.static(
+-            dim=self._mindie_llm_config.hf_config.head_dim,
+-            base=self._mindie_llm_config.hf_config.rope_theta,
+-            device="cpu",
+-            scaling_factor=self._mindie_llm_config.hf_config.rope_scaling.factor
+-        ).to(self.device)
+-        self.rotary_emb.update_cos_sin_cache_total(
+-            self.config.torch_dtype,
+-            self.device,
+-            self.max_position_embeddings
+-        )
+-        self.cos_table = self.rotary_emb.get_cos_cached_total().npu()
+-        self.sin_table = self.rotary_emb.get_sin_cached_total().npu()
+-
+         # NOTE: These attributes maybe depreciated after TG is refactored.
+         self.index_head_dim = getattr(self._mindie_llm_config.hf_config, "index_head_dim", None)
+         self.num_index_heads = getattr(self._mindie_llm_config.hf_config, "index_n_heads", None)
+@@ -315,7 +304,7 @@ class ModelRunnerExp:
+             Forward context.
+         """
+         forward_context = create_forward_context(
+-            model_inputs, self.cos_table, self.sin_table, self._mask, self.num_speculative_tokens)
++            model_inputs, self._mask, self.num_speculative_tokens)
+         forward_context.to_device(self.device)
+         return forward_context
+ 
+@@ -463,7 +452,7 @@ class ModelRunnerExp:
+ 
+         # capturing is True to set address for capturing
+         forward_context = create_forward_context(
+-            model_inputs, self.cos_table, self.sin_table, self._mask, self.num_speculative_tokens)
++            model_inputs, self._mask, self.num_speculative_tokens)
+         if DPMetadata.is_enabled():
+             forward_context.dp_metadata.get_num_tokens_across_dp_cpu()
+         forward_context.batch_descriptor = BatchDescriptor(
+diff --git a/mindie_llm/runtime/models/deepseek_v3/config_deepseek_v3.py b/mindie_llm/runtime/models/deepseek_v3/config_deepseek_v3.py
+index b2c54f9a8dce44520df417a93a531f4d43f7f127..c5e39e3016ee1f7067e2cb8e79570461a48bf616 100644
+--- a/mindie_llm/runtime/models/deepseek_v3/config_deepseek_v3.py
++++ b/mindie_llm/runtime/models/deepseek_v3/config_deepseek_v3.py
+@@ -9,14 +9,87 @@
+ # See the Mulan PSL v2 for more details.
+ 
+ from typing import Optional, Any
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ 
+-from mindie_llm.runtime.config.huggingface_config import HuggingFaceConfig
+-from mindie_llm.runtime.utils.helpers.parameter_validators import IntParameterValidator, Field
++from mindie_llm.runtime.config.huggingface_config import HuggingFaceConfig, BaseRopeScaling
++from mindie_llm.runtime.utils.helpers.parameter_validators import IntParameterValidator, FloatParameterValidator, Field
+ from mindie_llm.utils.log.error_code import ErrorCode
+ from mindie_llm.utils.log.logging import logger
+ 
+ 
++@dataclass
++class DeepSeekV3RopeScaling(BaseRopeScaling):
++    """DeepSeek-V3-specific RoPE scaling configuration.
++    
++    DeepSeek-V3 uses YaRN scaling with DeepSeek-specific parameters like mscale_all_dim.
++    """
++    rope_type: str = field(default='deepseek_yarn')
++    
++    factor: float = field(default=1.0, metadata={
++        'validator': FloatParameterValidator(Field(ge=-65504, le=65504))
++    })
++    
++    original_max_position_embeddings: int | None = field(default=None, metadata={
++        'validator': IntParameterValidator(Field(ge=1, le=2147483647), allow_none=True)
++    })
++    
++    beta_fast: int = field(default=32, metadata={
++        'validator': IntParameterValidator(Field(ge=1, le=2147483647))
++    })
++    beta_slow: int = field(default=1, metadata={
++        'validator': IntParameterValidator(Field(ge=1, le=2147483647))
++    })
++    
++    mscale: float = field(default=1.0, metadata={
++        'validator': FloatParameterValidator(Field(gt=0), allow_none=True)
++    })
++    
++    mscale_all_dim: float | None = field(default=None, metadata={
++        'validator': FloatParameterValidator(Field(gt=0), allow_none=True)
++    })
++    
++    def __post_init__(self):
++        if self.factor > 1.0:
++            if self.original_max_position_embeddings is not None:
++                self.max_position_embeddings = int(self.factor * \
++                    self.original_max_position_embeddings)
++            else:
++                _msg = ("Rope Scaling Failed. The `rope_scaling.factor` > 1.0, "
++                    "but `rope_scaling.original_max_position_embeddings` is None. "
++                    "Please check your `rope_scaling` in model's config.json.")
++                logger.warning(_msg)
++
++    @classmethod
++    def from_dict(cls, config_dict: dict[str, Any], 
++                  rope_theta: float = 10000.0,
++                  max_position_embeddings: int | None = None) -> 'DeepSeekV3RopeScaling':
++        if config_dict is None:
++            config_dict = {}
++        
++        rope_type = config_dict.get('rope_type', config_dict.get('type', 'deepseek_yarn'))
++        factor = config_dict.get('factor', 1.0)
++        original_max = config_dict.get('original_max_position_embeddings', None)
++        beta_fast = config_dict.get('beta_fast', 32)
++        beta_slow = config_dict.get('beta_slow', 1)
++        mscale = config_dict.get('mscale', 1.0)
++        mscale_all_dim = config_dict.get('mscale_all_dim', None)
++        
++        if factor > 1.0 and original_max is not None:
++            max_position_embeddings = int(factor * original_max)
++        
++        return cls(
++            rope_type=rope_type,
++            rope_theta=rope_theta,
++            max_position_embeddings=max_position_embeddings,
++            factor=factor,
++            original_max_position_embeddings=original_max,
++            beta_fast=beta_fast,
++            beta_slow=beta_slow,
++            mscale=mscale,
++            mscale_all_dim=mscale_all_dim
++        )
++
++
+ @dataclass
+ class DeepseekV3Config(HuggingFaceConfig):
+     model_type: str = "deepseekv3"
+@@ -41,7 +114,7 @@ class DeepseekV3Config(HuggingFaceConfig):
+     end_reasoning_token_id: int = 128799
+     is_nzcasted: bool = False
+ 
+-    def __init__(self, rope_scaling, **kwargs):
++    def __init__(self, **kwargs):
+         # (NOTE): delete kwargs in the future
+         super().__init__(**kwargs)
+         self.attribute_map = {
+@@ -52,8 +125,6 @@ class DeepseekV3Config(HuggingFaceConfig):
+             self.ep_level = 1
+         if self.model_type in ["deepseek_v3"]:
+             self.is_reasoning_model = True
+-        # (NOTE): add validation
+-        self.rope_scaling_dict = rope_scaling
+         # (NOTE): get from config
+         self.index_n_heads = 64
+         self.index_head_dim = 128
+@@ -100,3 +171,22 @@ class DeepseekV3Config(HuggingFaceConfig):
+                   f"got topk_group={self.topk_group}, n_group={self.n_group}"
+             logger.error(msg, ErrorCode.ATB_MODELS_PARAM_OUT_OF_RANGE)
+             raise ValueError(msg)
++    
++    def _create_rope_scaling(self, rope_scaling_dict: dict[str, str] | None,
++                             rope_theta: float,
++                             max_position_embeddings: int | None) -> DeepSeekV3RopeScaling:
++        """Create DeepSeek-V3-specific RoPE scaling configuration.
++        
++        Args:
++            rope_scaling_dict: The rope_scaling dictionary from config.json
++            rope_theta: The model's rope_theta value
++            max_position_embeddings: The model's max_position_embeddings value
++            
++        Returns:
++            Configured DeepSeekV3RopeScaling instance
++        """
++        return DeepSeekV3RopeScaling.from_dict(
++            rope_scaling_dict,
++            rope_theta=rope_theta,
++            max_position_embeddings=max_position_embeddings
++        )
+diff --git a/mindie_llm/runtime/models/deepseek_v3/deepseek_v3.py b/mindie_llm/runtime/models/deepseek_v3/deepseek_v3.py
+index cecb0033a90c79359662a18bbac5cc5d3e5115fc..bb46f22553e3dce4402a699a9106dbe8c9eb49f1 100644
+--- a/mindie_llm/runtime/models/deepseek_v3/deepseek_v3.py
++++ b/mindie_llm/runtime/models/deepseek_v3/deepseek_v3.py
+@@ -7,7 +7,6 @@
+ # EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+ # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ # See the Mulan PSL v2 for more details.
+-from typing import Any, NamedTuple, Optional, Tuple, Dict
+ import math
+ import torch
+ import torch_npu
+@@ -25,81 +24,9 @@ from mindie_llm.runtime.model_runner.forward_context import get_forward_context
+ from mindie_llm.runtime.utils.distributed import get_parallel_info_manager
+ from mindie_llm.runtime.layers.attention import get_global_attn_dict
+ from mindie_llm.runtime.layers.parameter import BaseParameter
+-
+-
+-# (Note): rewrite to a public function
+-def bind_cos_sin_table(cos_sin) -> None:
+-    attns = get_global_attn_dict()
+-    for _, prefix in enumerate(attns):
+-        attn_layer = attns[prefix]
+-        attn_layer.cos_sin = cos_sin
+-
+-
+-def init_rope(self) -> None:
+-    if self.config.rope_scaling_dict is None:
+-        self.rotary_emb = DeepseekV3RotaryEmbedding(
+-            self.config.qk_rope_head_dim,
+-            max_position_embeddings=self.config.max_position_embeddings,
+-            base=self.config.rope_theta,
+-        )
+-    else:
+-        scaling_type = self.config.rope_scaling_dict["type"]
+-        scaling_factor = self.config.rope_scaling_dict["factor"]
+-        if scaling_type == "yarn":
+-            kwargs = {}
+-            important_keys = [
+-                "original_max_position_embeddings",
+-                "beta_fast", 
+-                "beta_slow",
+-                "mscale",
+-                "mscale_all_dim"
+-            ]
+-            for key in important_keys:
+-                if key in self.config.rope_scaling_dict:
+-                    kwargs[key] = self.config.rope_scaling_dict[key]
+-            self.rotary_emb = DeepseekV3YarnRotaryEmbedding(
+-                self.config.qk_rope_head_dim,
+-                max_position_embeddings=self.config.max_position_embeddings,
+-                scaling_factor=scaling_factor,
+-                base=self.config.rope_theta,
+-                **kwargs,
+-            )
+-        else:
+-            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+-
+-
+-def _yarn_get_mscale(scale=1, mscale=1) -> float:
+-    if scale <= 1:
+-        return 1.0
+-    return 0.1 * mscale * math.log(scale) + 1.0
+-
+-
+-def _yarn_find_correction_dim(
+-    num_rotations, dim, base=10000, max_position_embeddings=2048
+-) -> float:
+-    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
+-        2 * math.log(base)
+-    )
+-
+-
+-def _yarn_find_correction_range(
+-    low_rot, high_rot, dim, base=10000, max_position_embeddings=2048
+-) -> float:
+-    low = math.floor(
+-        _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+-    )
+-    high = math.ceil(
+-        _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+-    )
+-    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
+-
+-
+-def _yarn_linear_ramp_mask(min_val, max_val, dim):
+-    if min_val == max:
+-        max_val += 0.001  # Prevent singularity
+-    linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (max_val - min_val)
+-    ramp_func = torch.clamp(linear_func, 0, 1)
+-    return ramp_func
++from mindie_llm.runtime.layers.embedding.rotary_embedding import get_rope
++from mindie_llm.runtime.layers.embedding.rotary_embedding.yarn_scaling_rope import yarn_get_mscale
++from mindie_llm.runtime.config.huggingface_config import HuggingFaceConfig
+ 
+ 
+ class DeepseekV3Moe(nn.Module):
+@@ -201,112 +128,6 @@ class DeepseekV3Moe(nn.Module):
+         return final_hidden_states + shared_expert_out
+ 
+ 
+-class DeepseekV3RotaryEmbedding(nn.Module):
+-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None) -> None:
+-        super().__init__()
+-        self.dim = dim
+-        self.max_position_embeddings = max_position_embeddings
+-        self.base = base
+-        inv_freq = 1.0 / (
+-            self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+-        )
+-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+-        self._set_cos_sin_cache(
+-            seq_len=max_position_embeddings,
+-            device=self.inv_freq.device,
+-            dtype=torch.get_default_dtype(),
+-        )
+-
+-    def forward(self, x, position_ids, kv_len, max_seq_len=None):
+-        if max_seq_len is None:
+-            self._set_cos_sin_cache(seq_len=kv_len, device=x.device, dtype=x.dtype)
+-        elif max_seq_len > self.max_seq_len_cached:
+-            self._set_cos_sin_cache(seq_len=max_seq_len, device=x.device, dtype=x.dtype)
+-        cos = torch.index_select(self.cos_cached, dim=0, index=position_ids.view(-1)).unsqueeze(1).unsqueeze(1)
+-        sin = torch.index_select(self.sin_cached, dim=0, index=position_ids.view(-1)).unsqueeze(1).unsqueeze(1)        
+-        return (
+-            cos.to(dtype=x.dtype),
+-            sin.to(dtype=x.dtype),
+-        )
+-
+-    def _set_cos_sin_cache(self, seq_len, device, dtype):
+-        self.max_seq_len_cached = seq_len
+-        t = torch.arange(
+-            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
+-        )
+-        freqs = torch.outer(t, self.inv_freq.to(t.device))
+-        emb = torch.cat((freqs, freqs), dim=-1)
+-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+-
+-
+-class DeepseekV3YarnRotaryEmbedding(DeepseekV3RotaryEmbedding):
+-    def __init__(
+-        self,
+-        dim,
+-        max_position_embeddings=2048,
+-        base=10000,
+-        device=None,
+-        scaling_factor=1.0,
+-        original_max_position_embeddings=4096,
+-        beta_fast=32,
+-        beta_slow=1,
+-        mscale=1,
+-        mscale_all_dim=0,
+-    ) -> None:
+-        self.scaling_factor = scaling_factor
+-        self.original_max_position_embeddings = original_max_position_embeddings
+-        self.beta_fast = beta_fast
+-        self.beta_slow = beta_slow
+-        self.mscale = mscale
+-        self.mscale_all_dim = mscale_all_dim
+-        super().__init__(dim, max_position_embeddings, base, device)
+-
+-    def _set_cos_sin_cache(self, seq_len, device, dtype):
+-        self.max_seq_len_cached = seq_len
+-        dim = self.dim
+-
+-        freq_extra = 1.0 / (
+-            self.base
+-            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+-        )
+-        freq_inter = 1.0 / (
+-            self.scaling_factor
+-            * self.base
+-            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+-        )
+-
+-        low, high = _yarn_find_correction_range(
+-            self.beta_fast,
+-            self.beta_slow,
+-            dim,
+-            self.base,
+-            self.original_max_position_embeddings,
+-        )
+-        inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, dim // 2).to(
+-            device=device, dtype=torch.float32
+-        )
+-        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+-
+-        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+-
+-        freqs = torch.outer(t, inv_freq)
+-
+-        _mscale = float(
+-            _yarn_get_mscale(self.scaling_factor, self.mscale)
+-            / _yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+-        )
+-
+-        emb = torch.cat((freqs, freqs), dim=-1)
+-        self.register_buffer(
+-            "cos_cached", (emb.cos() * _mscale).to(dtype), persistent=False
+-        )
+-        self.register_buffer(
+-            "sin_cached", (emb.sin() * _mscale).to(dtype), persistent=False
+-        )
+-
+-
+ class Indexer(nn.Module):
+     """
+     Indexer module for Deepseek V3.2
+@@ -359,7 +180,7 @@ class DeepseekV3Attention(nn.Module):
+     Multi-Head Latent Attention module for Deepseek V3
+     """
+     def __init__(self,
+-                config,
++                config: HuggingFaceConfig,
+                 prefix: str,
+                 quant_config,
+                 enable_mlapo,
+@@ -445,13 +266,22 @@ class DeepseekV3Attention(nn.Module):
+         )
+ 
+         self.softmax_scale = self.qk_head_dim ** (-0.5)
+-        if self.config.rope_scaling_dict is not None:
+-            mscale_all_dim = self.config.rope_scaling_dict.get("mscale_all_dim", 0)
+-            scaling_factor = self.config.rope_scaling_dict["factor"]
+-            if mscale_all_dim:
+-                mscale = _yarn_get_mscale(scaling_factor, mscale_all_dim)
+-                self.softmax_scale = self.softmax_scale * mscale * mscale
+-
++        rope_config = config.rope_scaling
++        mscale_all_dim = rope_config.mscale_all_dim
++        if mscale_all_dim:
++            mscale = yarn_get_mscale(rope_config.factor, mscale_all_dim)
++            self.softmax_scale = self.softmax_scale * mscale * mscale
++        
++        
++        rope_config.rope_type = "deepseek_yarn"
++        self.rope_emb = get_rope(
++            head_size=self.config.qk_rope_head_dim,
++            rotary_dim=self.config.qk_rope_head_dim,
++            max_position=rope_config.original_max_position_embeddings,
++            is_neox_style=True,
++            dtype=torch.get_default_dtype(),
++            rope_config=rope_config
++        )
+         ## v32
+         self.indexer = Indexer(
+             self.config,
+@@ -494,7 +324,9 @@ class DeepseekV3Attention(nn.Module):
+         Returns:
+             torch.Tensor: Output hidden states after attention
+         """
+-        return self.attn(hidden_states)
++        return self.attn(hidden_states,
++                        cos=self.rope_emb.cos_indexed_cache,
++                        sin=self.rope_emb.sin_indexed_cache)
+ 
+ 
+ class DeepseekV3MLP(nn.Module):
+@@ -557,7 +389,7 @@ class DeepseekV3Layer(nn.Module):
+     - Normalization after attention
+     - Mixture-of-Experts (MoE) or standard MLP
+     """
+-    def __init__(self, config, prefix: str, layer_idx: int, quant_config) -> None:
++    def __init__(self, config: HuggingFaceConfig, prefix: str, layer_idx: int, quant_config) -> None:
+         """
+         Initialize the MTP layer.
+ 
+@@ -610,7 +442,11 @@ class DeepseekV3Layer(nn.Module):
+                 quant_config
+             )
+ 
+-    def forward(self, hidden_states, past_residual) -> tuple[torch.Tensor, torch.Tensor]:
++    def forward(
++        self,
++        hidden_states,
++        past_residual,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
+         """
+         Forward pass of the deepseek layer.
+ 
+@@ -657,7 +493,7 @@ class DeepseekV3Model(nn.Module):
+     - Multiple layers
+     - Final layer normalization
+     """
+-    def __init__(self, config, prefix, quant_config) -> None:
++    def __init__(self, config: HuggingFaceConfig, prefix, quant_config) -> None:
+         """
+         Initialize the Deepseekv3 model.
+ 
+@@ -687,7 +523,6 @@ class DeepseekV3Model(nn.Module):
+             quant_config=quant_config,
+             prefix=f"{self.prefix}.norm"
+         )
+-        init_rope(self)
+ 
+     def forward(self, input_ids, positions) -> torch.Tensor:
+         """
+@@ -701,15 +536,8 @@ class DeepseekV3Model(nn.Module):
+             torch.Tensor: Final hidden states after processing
+         """
+         hidden_states = self.embed_tokens(input_ids)
+-
+-        forward_context = get_forward_context()    
+-        cos_sin = self.rotary_emb(
+-            hidden_states, 
+-            positions, forward_context.attn_metadata.seq_lens, 
+-            self.config.max_position_embeddings
+-        )
+-        bind_cos_sin_table(cos_sin)
+-
++        # NOTE precompute indexed cos sin cache for each layer.
++        self.layers[0].self_attn.rope_emb.set_cos_sin_indexed_cache(positions)
+         residual = None
+         for layer in self.layers:
+             residual, hidden_states = layer(hidden_states, residual)
+@@ -733,7 +561,7 @@ class DeepseekV3ForCausalLM(BaseModelForCausalLM):
+                 - quant_config: Quantization configuration
+         """
+         super().__init__(mindie_llm_config)
+-        self.config = mindie_llm_config.hf_config
++        self.config: HuggingFaceConfig = mindie_llm_config.hf_config
+         self.quant_config = mindie_llm_config.quant_config
+         self.parallel_info = get_parallel_info_manager()
+         self.ds_config = mindie_llm_config.llm_config.llm
+diff --git a/mindie_llm/runtime/models/deepseek_v3/deepseek_v3_mtp.py b/mindie_llm/runtime/models/deepseek_v3/deepseek_v3_mtp.py
+index d8cd0090a95b70badf85ce7fa4d6852b81f45d00..eba9f4e423ec2b5348cc46f1e0df0ec2ad765767 100644
+--- a/mindie_llm/runtime/models/deepseek_v3/deepseek_v3_mtp.py
++++ b/mindie_llm/runtime/models/deepseek_v3/deepseek_v3_mtp.py
+@@ -17,7 +17,7 @@ from mindie_llm.runtime.layers.linear.linear import ReplicatedLinear
+ from mindie_llm.runtime.layers.embedding.embedding import VocabParallelEmbedding, ParallelLMHead, maybe_slice_cross_tp
+ from mindie_llm.runtime.model_runner.forward_context import get_forward_context
+ from mindie_llm.runtime.utils.distributed import get_parallel_info_manager
+-from .deepseek_v3 import DeepseekV3Layer, init_rope, bind_cos_sin_table
++from .deepseek_v3 import DeepseekV3Layer
+ 
+ 
+ class SharedHead(nn.Module):
+@@ -136,7 +136,6 @@ class DeepseekV3MtpModel(nn.Module):
+                     DeepseekV3MtpLayer(config, prefix, self.layer_idx, quant_config)
+             }
+         )
+-        init_rope(self)
+ 
+     def forward(self, input_ids, positions) -> torch.Tensor:
+         """
+@@ -156,13 +155,7 @@ class DeepseekV3MtpModel(nn.Module):
+         last_hidden_states = maybe_slice_cross_tp(last_hidden_states, self.parallel_info.attn_tp)
+ 
+         hidden_states = mtp_layer.embed_tokens(input_ids)
+-        cos_sin = self.rotary_emb(
+-            hidden_states, 
+-            positions, forward_context.seq_lens, 
+-            self.config.max_position_embeddings
+-        )
+-        bind_cos_sin_table(cos_sin)
+-
++        mtp_layer.self_attn.rope_emb.set_cos_sin_indexed_cache(positions)
+         hidden_states = mtp_layer.enorm(hidden_states)
+         last_hidden_states = mtp_layer.hnorm(last_hidden_states)
+         hidden_states = torch.concat([hidden_states, last_hidden_states], dim=-1)
+diff --git a/mindie_llm/runtime/models/qwen2/config_qwen2.py b/mindie_llm/runtime/models/qwen2/config_qwen2.py
+index c8bbbe63f92af3b41e0dadf7591be55470febb66..542a6c43d723bc5b81799323faa6e4e19c14c3e4 100644
+--- a/mindie_llm/runtime/models/qwen2/config_qwen2.py
++++ b/mindie_llm/runtime/models/qwen2/config_qwen2.py
+@@ -8,9 +8,75 @@
+ # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+ # See the Mulan PSL v2 for more details.
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field, fields
++from typing import Any
+ 
+-from mindie_llm.runtime.config.huggingface_config import HuggingFaceConfig
++from mindie_llm.runtime.config.huggingface_config import HuggingFaceConfig, BaseRopeScaling
++from mindie_llm.runtime.utils.helpers.parameter_validators import (
++    FloatParameterValidator, RangeParamaterValidator, IntParameterValidator, Field
++)
++from mindie_llm.utils.log.logging import logger
++
++
++@dataclass
++class Qwen2RopeScaling(BaseRopeScaling):
++    """Qwen2-specific RoPE scaling configuration.
++    
++    Qwen2 uses a simple RoPE configuration with support for partial rotary embedding
++    and different rope types (default, linear, dynamic, yarn, longrope, llama3).
++    """
++    rope_type: str = field(default='default', metadata={
++        'validator': RangeParamaterValidator([
++            'default', 'yarn',
++        ])
++    })
++    
++    factor: float = field(default=1.0, metadata={
++        'validator': FloatParameterValidator(Field(ge=-65504, le=65504))
++    })
++    
++    original_max_position_embeddings: int | None = field(default=None, metadata={
++        'validator': IntParameterValidator(Field(ge=1, le=2147483647), allow_none=True)
++    })
++    
++    partial_rotary_factor: float = field(default=1.0, metadata={
++        'validator': FloatParameterValidator(Field(gt=0), allow_none=True)
++    })
++    
++    def __post_init__(self):
++        if self.factor > 1.0:
++            if self.original_max_position_embeddings is not None:
++                self.max_position_embeddings = int(self.factor * \
++                    self.original_max_position_embeddings)
++            else:
++                _msg = ("Rope Scaling Failed. The `rope_scaling.factor` > 1.0, "
++                    "but `rope_scaling.original_max_position_embeddings` is None. "
++                    "Please check your `rope_scaling` in model's config.json.")
++                logger.warning(_msg)
++
++    @classmethod
++    def from_dict(cls, config_dict: dict[str, Any], 
++                  rope_theta: float = 1000000.0,
++                  max_position_embeddings: int | None = None) -> 'Qwen2RopeScaling':
++        if config_dict is None:
++            config_dict = {}
++        
++        rope_type = config_dict.get('rope_type', config_dict.get('type', 'default'))
++        factor = config_dict.get('factor', 1.0)
++        original_max = config_dict.get('original_max_position_embeddings', None)
++        partial_rotary_factor = config_dict.get('partial_rotary_factor', 1.0)
++        
++        if factor > 1.0 and original_max is not None:
++            max_position_embeddings = int(factor * original_max)
++        
++        return cls(
++            rope_type=rope_type,
++            rope_theta=rope_theta,
++            max_position_embeddings=max_position_embeddings,
++            factor=factor,
++            original_max_position_embeddings=original_max,
++            partial_rotary_factor=partial_rotary_factor
++        )
+ 
+ 
+ @dataclass
+@@ -24,4 +90,23 @@ class Qwen2Config(HuggingFaceConfig):
+     def __init__(self, **kwargs):
+         super().__init__(**kwargs)
+         if not hasattr(self, "head_dim"):
+-            self.head_dim = self.hidden_size // self.num_attention_heads
+\ No newline at end of file
++            self.head_dim = self.hidden_size // self.num_attention_heads
++    
++    def _create_rope_scaling(self, rope_scaling_dict: dict[str, str] | None,
++                             rope_theta: float,
++                             max_position_embeddings: int | None) -> Qwen2RopeScaling:
++        """Create Qwen2-specific RoPE scaling configuration.
++        
++        Args:
++            rope_scaling_dict: The rope_scaling dictionary from config.json
++            rope_theta: The model's rope_theta value
++            max_position_embeddings: The model's max_position_embeddings value
++            
++        Returns:
++            Configured Qwen2RopeScaling instance
++        """
++        return Qwen2RopeScaling.from_dict(
++            rope_scaling_dict,
++            rope_theta=rope_theta,
++            max_position_embeddings=max_position_embeddings
++        )
+\ No newline at end of file
+diff --git a/mindie_llm/runtime/models/qwen2/qwen2.py b/mindie_llm/runtime/models/qwen2/qwen2.py
+index 19fe93c348e88ebf057742fea28f02624f4c82d5..75804c12e5ffe8b4038008a70cac0e1a4d348fa1 100644
+--- a/mindie_llm/runtime/models/qwen2/qwen2.py
++++ b/mindie_llm/runtime/models/qwen2/qwen2.py
+@@ -27,6 +27,7 @@ from mindie_llm.runtime.utils.distributed.parallel_info_manager import ParallelT
+ from mindie_llm.runtime.layers.quantization.quantization_config_base import QuantizationConfigBase
+ from mindie_llm.runtime.models.base.model import BaseModelForCausalLM
+ from mindie_llm.runtime.model_runner.forward_context import get_forward_context
++from mindie_llm.runtime.layers.embedding.rotary_embedding import get_rope
+ 
+ 
+ class Qwen2Attention(nn.Module):
+@@ -108,6 +109,14 @@ class Qwen2Attention(nn.Module):
+             parallel_info=attn_tp
+         )
+ 
++        self.rope_emb = get_rope(
++            self.head_dim,
++            self.head_dim,
++            self.config.rope_scaling.max_position_embeddings,
++            is_neox_style=True,
++            rope_config=config.rope_scaling,
++        )
++
+         self.attn = Attention(
+             head_size=self.head_dim,
+             num_heads=self.num_heads_per_rank,
+@@ -122,7 +131,7 @@ class Qwen2Attention(nn.Module):
+     def forward(
+         self,
+         positions: torch.Tensor,
+-        hidden_states: torch.Tensor
++        hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
+         """
+         Forward pass of the attention module.
+@@ -136,24 +145,7 @@ class Qwen2Attention(nn.Module):
+         """
+         qkv = self.qkv_proj(hidden_states)
+         query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+-       
+-        forward_context = get_forward_context()
+-        attn_metadata = forward_context.attn_metadata
+-        if isinstance(attn_metadata, dict):
+-            attn_metadata = attn_metadata[self.prefix]
+-        cos_table = attn_metadata.cos_table
+-        sin_table = attn_metadata.sin_table
+-
+-        query = query.contiguous().view(1, query.shape[0], -1,
+-                                        self.head_dim)
+-        key = key.contiguous().view(1, key.shape[0], -1, self.head_dim)
+-        last_dim = cos_table.size()[-1]
+-        cos_table = torch.index_select(cos_table, 0, positions)
+-        sin_table = torch.index_select(sin_table, 0, positions)
+-        cos_table = cos_table.view(1, -1, 1, last_dim).contiguous()
+-        sin_table = sin_table.view(1, -1, 1, last_dim).contiguous()
+-        torch_npu.npu_apply_rotary_pos_emb(query, key, cos_table, sin_table)
+-        
++        query, key = self.rope_emb(positions, query, key)
+         attn_output = self.attn(query, key, value)
+ 
+         output = self.o_proj(attn_output)
+@@ -264,6 +256,8 @@ class Qwen2Layer(nn.Module):
+         input_layernorm: Input layer normalization
+         post_attention_layernorm: Post-attention layer normalization
+     """
++    attn_cls = Qwen2Attention
++    mlp_cls = Qwen2Mlp
+ 
+     def __init__(
+             self,
+@@ -358,6 +352,7 @@ class Qwen2Model(nn.Module):
+         layers: List of transformer layers
+         norm: Final layer normalization
+     """
++    layer_cls = Qwen2Layer
+ 
+     def __init__(
+             self,
+@@ -417,6 +412,7 @@ class Qwen2Model(nn.Module):
+         """
+         residual = None
+         hidden_states = self.embed_tokens(input_ids)
++        self.layers[0].self_attn.rope_emb.set_cos_sin_indexed_cache(positions)
+         for layer in self.layers:
+             hidden_states, residual = layer(positions, hidden_states, residual)
+         
+@@ -426,7 +422,6 @@ class Qwen2Model(nn.Module):
+ 
+ 
+ class Qwen2ForCausalLM(BaseModelForCausalLM):
+-    model_cls = Qwen2Model
+     """
+     Qwen2 model for causal language modeling.
+ 
+@@ -448,6 +443,8 @@ class Qwen2ForCausalLM(BaseModelForCausalLM):
+         model: Base Qwen2 model
+         lm_head: Language modeling head
+     """
++    model_cls = Qwen2Model
++
+     def __init__(self, mindie_llm_config: MindIELLMConfig):
+         """
+         Initialize the Qwen2 causal language model.
+diff --git a/mindie_llm/runtime/models/qwen3/qwen3.py b/mindie_llm/runtime/models/qwen3/qwen3.py
+index cca3af2e4cf29cced3c198a279bf82616eabddf7..f6c4762d9175a1b50e17ceee118837b0acb643bd 100644
+--- a/mindie_llm/runtime/models/qwen3/qwen3.py
++++ b/mindie_llm/runtime/models/qwen3/qwen3.py
+@@ -20,7 +20,9 @@ from mindie_llm.runtime.config.mindie_llm_config import MindIELLMConfig
+ 
+ from mindie_llm.runtime.layers.quantization.quantization_config_base import QuantizationConfigBase
+ from mindie_llm.runtime.model_runner.forward_context import get_forward_context
+-from mindie_llm.runtime.models.qwen2.qwen2 import Qwen2Attention, Qwen2Mlp, Qwen2Layer, Qwen2Model, Qwen2ForCausalLM
++from mindie_llm.runtime.models.qwen2.qwen2 import (
++    Qwen2Attention, Qwen2Mlp, Qwen2Layer, Qwen2Model, Qwen2ForCausalLM
++)
+ 
+ 
+ class Qwen3Attention(Qwen2Attention):
+@@ -81,7 +83,7 @@ class Qwen3Attention(Qwen2Attention):
+     def forward(
+         self,
+         positions: torch.Tensor,
+-        hidden_states: torch.Tensor
++        hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
+         """
+         Forward pass of the attention module.
+@@ -103,24 +105,7 @@ class Qwen3Attention(Qwen2Attention):
+             k_by_head = key.view(*key.shape[:-1], key.shape[-1] // self.head_dim, self.head_dim)
+             k_by_head = self.k_norm(k_by_head)
+             key = k_by_head.view(key.shape)
+-
+-        forward_context = get_forward_context()
+-        attn_metadata = forward_context.attn_metadata
+-        if isinstance(attn_metadata, dict):
+-            attn_metadata = attn_metadata[self.prefix]
+-        cos_table = attn_metadata.cos_table
+-        sin_table = attn_metadata.sin_table
+-
+-        query = query.contiguous().view(1, query.shape[0], -1,
+-                                        self.head_dim)
+-        key = key.contiguous().view(1, key.shape[0], -1, self.head_dim)
+-        last_dim = cos_table.size()[-1]
+-        cos_table = torch.index_select(cos_table, 0, positions)
+-        sin_table = torch.index_select(sin_table, 0, positions)
+-        cos_table = cos_table.view(1, -1, 1, last_dim).contiguous()
+-        sin_table = sin_table.view(1, -1, 1, last_dim).contiguous()
+-        torch_npu.npu_apply_rotary_pos_emb(query, key, cos_table, sin_table)
+-        
++        query, key = self.rope_emb(positions, query, key)
+         attn_output = self.attn(query, key, value)
+ 
+         output = self.o_proj(attn_output)
+@@ -167,8 +152,6 @@ class Qwen3Mlp(Qwen2Mlp):
+  
+ 
+ class Qwen3Layer(Qwen2Layer):
+-    attn_cls = Qwen3Attention
+-    mlp_cls = Qwen3Mlp
+     """
+     Qwen3 transformer layer.
+ 
+@@ -195,6 +178,8 @@ class Qwen3Layer(Qwen2Layer):
+         input_layernorm: Input layer normalization
+         post_attention_layernorm: Post-attention layer normalization
+     """
++    attn_cls = Qwen3Attention
++    mlp_cls = Qwen3Mlp
+ 
+     def __init__(
+             self,
+@@ -216,7 +201,6 @@ class Qwen3Layer(Qwen2Layer):
+ 
+         
+ class Qwen3Model(Qwen2Model):
+-    layer_cls = Qwen3Layer
+     """
+     Qwen3 base model.
+ 
+@@ -239,6 +223,7 @@ class Qwen3Model(Qwen2Model):
+         layers: List of transformer layers
+         norm: Final layer normalization
+     """
++    layer_cls = Qwen3Layer
+ 
+     def __init__(
+             self,
+@@ -280,6 +265,8 @@ class Qwen3ForCausalLM(Qwen2ForCausalLM):
+         model: Base Qwen3 model
+         lm_head: Language modeling head
+     """
++    model_cls = Qwen3Model
++
+     def __init__(self, mindie_llm_config: MindIELLMConfig):
+         """
+         Initialize the Qwen3 causal language model.
+@@ -290,8 +277,3 @@ class Qwen3ForCausalLM(Qwen2ForCausalLM):
+                 - quant_config: Quantization configuration
+         """
+         super().__init__(mindie_llm_config)
+-
+-
+-        
+-        
+-        
+diff --git a/mindie_llm/runtime/utils/helpers/parameter_validators.py b/mindie_llm/runtime/utils/helpers/parameter_validators.py
+index 3246e9ec34a41092ec420e0c0764883c754ff560..b92f5b5ca157ede40a1750d64891973097f53bd1 100644
+--- a/mindie_llm/runtime/utils/helpers/parameter_validators.py
++++ b/mindie_llm/runtime/utils/helpers/parameter_validators.py
+@@ -281,6 +281,7 @@ class ListParameterValidator(ParameterValidator):
+ 
+     def create_validation_pipeline(self, value_type: Union[Type, Tuple[Type, ...]] | None):
+         self.pipeline.refresh()
++        self.pipeline.add(ValidationStrategies.validate_none, self.allow_none)
+         self.pipeline.add(ValidationStrategies.validate_type, value_type)
+         self.pipeline.add(ValidationStrategies.validate_range, self.fields, self.constraints)
+         self.pipeline.add(self.validate_elements)
+diff --git a/tests/pythontest/cpu/model_wrapper/aclgraph/test_aclgraph_model_wrapper_exp.py b/tests/pythontest/cpu/model_wrapper/aclgraph/test_aclgraph_model_wrapper_exp.py
+index de0637c3b5811df1467263675624fc2e2821969a..e1bba23940fdff0cb3d0bc78bf39c8f0f01eae71 100644
+--- a/tests/pythontest/cpu/model_wrapper/aclgraph/test_aclgraph_model_wrapper_exp.py
++++ b/tests/pythontest/cpu/model_wrapper/aclgraph/test_aclgraph_model_wrapper_exp.py
+@@ -35,6 +35,7 @@ def mock_model_runner_exp():
+     mock_runner.index_head_dim = 128
+     mock_runner.num_index_heads = 0
+     mock_runner.max_position_embeddings = 32768
++    mock_runner.max_seq_len = -1
+     mock_runner.adapter_manager = None
+     mock_runner.model = MagicMock()
+     mock_runner.model.is_multimodal = False
+@@ -126,6 +127,7 @@ def test_init_success(
+         moe_tp=-1,
+         moe_ep=-1,
+         role='standard',
++        max_seq_len=-1,
+         sampler_config=None,
+         distributed_enable=False,
+     )
+diff --git a/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_base.py b/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_base.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6636b3414dc0b3b5eaacbdfcc4b48d1a8b479022
+--- /dev/null
++++ b/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_base.py
+@@ -0,0 +1,114 @@
++# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
++# MindIE is licensed under Mulan PSL v2.
++# You can use this software according to the terms and conditions of the Mulan PSL v2.
++# You may obtain a copy of Mulan PSL v2 at:
++#          http://license.coscl.org.cn/MulanPSL2
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
++# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
++# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
++# See the Mulan PSL v2 for more details.
++
++import unittest
++import sys
++from unittest.mock import patch, MagicMock
++import torch
++from mindie_llm.runtime.layers.embedding.rotary_embedding.base import RotaryEmbedding
++
++
++# Mock torch_npu at import time to avoid ModuleNotFoundError
++if 'torch_npu' not in sys.modules:
++    sys.modules['torch_npu'] = MagicMock()
++    sys.modules['torch_npu.npu'] = MagicMock()
++
++
++class TestRotaryEmbedding(unittest.TestCase):
++
++    def setUp(self):
++        self.device = "cpu"
++        # Mock NPU kernel to return tensors with correct shape (no actual computation)
++        self.npu_patch = patch('torch_npu.npu_apply_rotary_pos_emb', side_effect=self._mock_npu_kernel)
++        self.npu_patch.start()
++
++    def tearDown(self):
++        self.npu_patch.stop()
++
++    def _mock_npu_kernel(self, query: torch.Tensor, key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
++        """Mock NPU kernel that preserves input shapes without actual computation."""
++        # Return clones with same shape to simulate successful operation
++        return query.clone(), key.clone()
++
++    def test_init_buffers_registered(self):
++        rope = RotaryEmbedding(
++            head_size=64,
++            rotary_dim=64,
++            max_position_embeddings=128,
++            base=10000.0,
++            is_neox_style=True,
++            dtype=torch.float16
++        ).to(self.device)
++
++        # Check that buffers are registered (cos_sin_cache removed in new implementation)
++        self.assertTrue(hasattr(rope, 'inv_freq'))
++        self.assertTrue(hasattr(rope, 'cos_cache'))
++        self.assertTrue(hasattr(rope, 'sin_cache'))
++
++        # Check shapes only
++        self.assertEqual(rope.inv_freq.shape, (32,))  # rotary_dim // 2
++        self.assertEqual(rope.cos_cache.shape, (128, 32))
++        self.assertEqual(rope.sin_cache.shape, (128, 32))
++
++        # Check device
++        self.assertEqual(rope.cos_cache.device.type, self.device)
++
++    def test_external_cos_sin_path_shape(self):
++        # This path requires: neox=True, head_size=128, rotary_dim=128
++        rope = RotaryEmbedding(
++            head_size=128,
++            rotary_dim=128,
++            max_position_embeddings=256,
++            base=10000.0,
++            is_neox_style=True,
++            dtype=torch.float16
++        ).to(self.device)
++
++        positions = torch.arange(4, device=self.device)
++        cos, sin = rope.get_cos_sin_for_positions(positions)  # [4, 64]
++
++        # Shape adaptation: [4, 64] -> [4, 1, 1, 128]
++        rope.cos_indexed_cache = cos.unsqueeze(1).unsqueeze(1).repeat(1, 1, 1, 2)  # 64 * 2 = 128
++        rope.sin_indexed_cache = sin.unsqueeze(1).unsqueeze(1).repeat(1, 1, 1, 2)
++
++        query = torch.randn(1, 4, 2, 128, dtype=torch.float16, device=self.device)
++        key = torch.randn(1, 4, 2, 128, dtype=torch.float16, device=self.device)
++
++        q_out, k_out = rope(positions, query, key)
++
++    def test_get_cos_sin_for_positions_shape(self):
++        rope = RotaryEmbedding(
++            head_size=64,
++            rotary_dim=64,
++            max_position_embeddings=128,
++            base=10000.0,
++            dtype=torch.float32
++        ).to(self.device)
++
++        positions = torch.tensor([10, 20, 30], device=self.device)
++        cos, sin = rope.get_cos_sin_for_positions(positions)
++        self.assertEqual(cos.shape, (3, 32))
++        self.assertEqual(sin.shape, (3, 32))
++
++    def test_buffers_are_non_persistent(self):
++        rope = RotaryEmbedding(
++            head_size=32,
++            rotary_dim=32,
++            max_position_embeddings=64,
++            base=10000.0
++        )
++        state_dict = rope.state_dict()
++        # Non-persistent buffers must NOT appear in state_dict
++        for buf_name in ['inv_freq', 'cos_cache', 'sin_cache']:
++            self.assertNotIn(buf_name, state_dict)
++
++
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file
+diff --git a/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_init.py b/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_init.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..13c7f22327cdea6d76b4fe504ec7c4c85a93dab9
+--- /dev/null
++++ b/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_init.py
+@@ -0,0 +1,178 @@
++# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
++# MindIE is licensed under Mulan PSL v2.
++# You can use this software according to the terms and conditions of the Mulan PSL v2.
++# You may obtain a copy of Mulan PSL v2 at:
++#          http://license.coscl.org.cn/MulanPSL2
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
++# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
++# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
++# See the Mulan PSL v2 for more details.
++
++import unittest
++from unittest.mock import patch, MagicMock
++from dataclasses import asdict
++import torch
++from mindie_llm.runtime.config.huggingface_config import RopeScaling
++from mindie_llm.runtime.layers.embedding.rotary_embedding import get_rope
++from mindie_llm.runtime.layers.embedding.rotary_embedding.base import RotaryEmbedding
++from mindie_llm.runtime.layers.embedding.rotary_embedding.yarn_scaling_rope import (
++    YarnScalingRotaryEmbedding,
++)
++from mindie_llm.runtime.layers.embedding.rotary_embedding.deepseek_v3_yarn_scaling_rope import (
++    DeepseekV3YarnRotaryEmbedding
++)
++from mindie_llm.runtime.layers.embedding.rotary_embedding.registry import clear_rope_cache
++
++
++class TestGetRoPE(unittest.TestCase):
++
++    def setUp(self):
++        clear_rope_cache()
++
++    def _create_config(self, **kwargs):
++        defaults = {
++            "rope_type": "default",
++            "rope_theta": 10000.0,
++            "original_max_position_embeddings": 2048,
++            "partial_rotary_factor": 1.0,
++        }
++        defaults.update(kwargs)
++        return RopeScaling(**defaults)
++
++    def test_routes_to_default_factory(self):
++        config = self._create_config(rope_type="default")
++        
++        with patch("mindie_llm.runtime.layers.embedding.rotary_embedding.registry._ROPE_REGISTRY") as mock_registry:
++            mock_factory = MagicMock(return_value=RotaryEmbedding(64, 64, 128, 10000.0, True, torch.float16))
++            mock_registry.get.return_value = mock_factory
++            
++            rope = get_rope(
++                head_size=64,
++                rotary_dim=64,
++                max_position=128,
++                rope_config=config,
++                is_neox_style=True,
++                dtype=torch.float16
++            )
++            
++            mock_registry.get.assert_called_once_with("default")
++            mock_factory.assert_called_once()
++            self.assertIsInstance(rope, RotaryEmbedding)
++
++    def test_routes_to_yarn_factory(self):
++        config = self._create_config(
++            rope_type="yarn",
++            factor=2.0,
++            beta_fast=32,
++            beta_slow=1,
++            extrapolation_factor=1.0,
++            apply_yarn_scaling=True,
++            truncate=True,
++            mscale=1.0
++        )
++        
++        with patch("mindie_llm.runtime.layers.embedding.rotary_embedding.registry._ROPE_REGISTRY") as mock_registry:
++            mock_factory = MagicMock(return_value=YarnScalingRotaryEmbedding(64, 64, 128, 10000.0, True, torch.bfloat16))
++            mock_registry.get.return_value = mock_factory
++            
++            rope = get_rope(
++                head_size=64,
++                rotary_dim=64,
++                max_position=128,
++                rope_config=config,
++                is_neox_style=True,
++                dtype=torch.bfloat16
++            )
++            
++            mock_registry.get.assert_called_once_with("yarn")
++            mock_factory.assert_called_once()
++            self.assertIsInstance(rope, YarnScalingRotaryEmbedding)
++
++    def test_routes_to_deepseek_yarn_factory(self):
++        config = self._create_config(
++            rope_type="deepseek_yarn",
++            factor=8.0,
++            beta_fast=64,
++            beta_slow=1,
++            mscale=1.0,
++            mscale_all_dim=0.0
++        )
++        
++        with patch("mindie_llm.runtime.layers.embedding.rotary_embedding.registry._ROPE_REGISTRY") as mock_registry:
++            mock_factory = MagicMock(return_value=DeepseekV3YarnRotaryEmbedding(128, 2048, 10000.0, is_neox_style=True, dtype=torch.float32))
++            mock_registry.get.return_value = mock_factory
++            
++            rope = get_rope(
++                head_size=128,
++                rotary_dim=128,
++                max_position=2048,
++                rope_config=config,
++                is_neox_style=True,
++                dtype=torch.float32
++            )
++            
++            mock_registry.get.assert_called_once_with("deepseek_yarn")
++            mock_factory.assert_called_once()
++            self.assertIsInstance(rope, DeepseekV3YarnRotaryEmbedding)
++
++    def test_applies_partial_rotary_factor_before_factory_call(self):
++        config = self._create_config(rope_type="default", partial_rotary_factor=0.5)
++        
++        with patch("mindie_llm.runtime.layers.embedding.rotary_embedding.registry._ROPE_REGISTRY") as mock_registry:
++            mock_factory = MagicMock(return_value=RotaryEmbedding(64, 32, 128, 10000.0, True, torch.float16))
++            mock_registry.get.return_value = mock_factory
++            
++            rope = get_rope(
++                head_size=64,
++                rotary_dim=64,  # Original rotary_dim
++                max_position=128,
++                rope_config=config,
++                is_neox_style=True,
++                dtype=torch.float16
++            )
++            
++            # Verify factory was called with scaled rotary_dim (64 * 0.5 = 32)
++            call_args = mock_factory.call_args[0]
++            called_rotary_dim = call_args[1]  # Second positional arg is rotary_dim
++            self.assertEqual(called_rotary_dim, 32)
++            self.assertEqual(rope.rotary_dim, 32)
++
++    def test_cache_reuse_for_identical_configurations(self):
++        config = self._create_config(rope_type="yarn", factor=2.0, beta_fast=32, beta_slow=1, mscale=1.0)
++        
++        # First call creates instance
++        rope1 = get_rope(64, 64, 128, config, dtype=torch.float16)
++        
++        # Second call with identical params should return same instance
++        rope2 = get_rope(64, 64, 128, config, dtype=torch.float16)
++        
++        self.assertIs(rope1, rope2)
++
++    def test_raises_value_error_for_unknown_rope_type(self):
++        config = self._create_config(rope_type="unknown_type")
++        
++        with self.assertRaises(ValueError) as cm:
++            get_rope(
++                head_size=64,
++                rotary_dim=64,
++                max_position=128,
++                rope_config=config,
++                dtype=torch.float16
++            )
++        
++        self.assertIn("unknown_type", str(cm.exception))
++        self.assertIn("default", str(cm.exception))  # Should list available types
++
++    def test_factory_not_called_for_cached_instances(self):
++        config = self._create_config(rope_type="default")
++        
++        with patch("mindie_llm.runtime.layers.embedding.rotary_embedding.registry._ROPE_REGISTRY") as mock_registry:
++            mock_factory = MagicMock(return_value=RotaryEmbedding(64, 64, 128, 10000.0, True, torch.float16))
++            mock_registry.get.return_value = mock_factory
++            
++            rope1 = get_rope(64, 64, 128, config, dtype=torch.float16)
++            self.assertEqual(mock_factory.call_count, 1)
++
++
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file
+diff --git a/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_registry.py b/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_registry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..94bb93f673c2367029ac305e275ad3c548745e01
+--- /dev/null
++++ b/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_registry.py
+@@ -0,0 +1,252 @@
++# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
++# MindIE is licensed under Mulan PSL v2.
++# You can use this software according to the terms and conditions of the Mulan PSL v2.
++# You may obtain a copy of Mulan PSL v2 at:
++#          http://license.coscl.org.cn/MulanPSL2
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
++# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
++# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
++# See the Mulan PSL v2 for more details.
++
++import unittest
++from unittest.mock import MagicMock, Mock
++from dataclasses import dataclass, asdict
++from functools import wraps
++from typing import Callable
++import torch
++from mindie_llm.runtime.config.huggingface_config import RopeScaling
++from mindie_llm.runtime.layers.embedding.rotary_embedding.registry import (
++    register_rope_type,
++    unregister_rope_type,
++    get_registered_rope_types,
++    cached_rope_factory,
++    clear_rope_cache,
++    get_rope_factory,
++    _ROPE_REGISTRY,
++    _ROPE_DICT
++)
++
++
++class TestRegistry(unittest.TestCase):
++
++    def setUp(self):
++        # Clear registry and cache before each test
++        _ROPE_REGISTRY.clear()
++        _ROPE_DICT.clear()
++
++    def tearDown(self):
++        # Ensure cleanup after each test
++        _ROPE_REGISTRY.clear()
++        _ROPE_DICT.clear()
++
++    def test_register_rope_type_registers_factory(self):
++        @register_rope_type("test_type")
++        def dummy_factory(*args, **kwargs):
++            return Mock()
++
++        self.assertIn("test_type", _ROPE_REGISTRY)
++        self.assertEqual(_ROPE_REGISTRY["test_type"], dummy_factory)
++
++    def test_register_rope_type_rejects_duplicate_registration(self):
++        @register_rope_type("duplicate_type")
++        def factory1(*args, **kwargs):
++            return Mock()
++
++        with self.assertRaises(ValueError) as cm:
++            @register_rope_type("duplicate_type")
++            def factory2(*args, **kwargs):
++                return Mock()
++        
++        self.assertIn("duplicate_type", str(cm.exception))
++
++    def test_unregister_rope_type_removes_from_registry(self):
++        @register_rope_type("removable_type")
++        def dummy_factory(*args, **kwargs):
++            return Mock()
++
++        self.assertIn("removable_type", _ROPE_REGISTRY)
++        unregister_rope_type("removable_type")
++        self.assertNotIn("removable_type", _ROPE_REGISTRY)
++
++    def test_unregister_rope_type_no_error_for_missing_type(self):
++        # Should not raise when unregistering non-existent type
++        unregister_rope_type("non_existent_type")
++        self.assertNotIn("non_existent_type", _ROPE_REGISTRY)
++
++    def test_get_registered_rope_types_returns_correct_list(self):
++        @register_rope_type("type_a")
++        def factory_a(*args, **kwargs): return Mock()
++        
++        @register_rope_type("type_b")
++        def factory_b(*args, **kwargs): return Mock()
++        
++        @register_rope_type("type_c")
++        def factory_c(*args, **kwargs): return Mock()
++
++        registered = get_registered_rope_types()
++        self.assertEqual(set(registered), {"type_a", "type_b", "type_c"})
++
++    def test_cached_rope_factory_caches_instances(self):
++        mock_instance = Mock()
++        call_count = [0]  # Mutable counter
++
++        @cached_rope_factory
++        def test_factory(head_size, rotary_dim, max_position, base, is_neox_style, dtype, rope_config):
++            call_count[0] += 1
++            return mock_instance
++
++        config = RopeScaling(
++            rope_type="test",
++            rope_theta=10000.0,
++            original_max_position_embeddings=2048,
++            partial_rotary_factor=1.0
++        )
++
++        # First call - should create instance
++        result1 = test_factory(64, 64, 128, 10000.0, True, torch.float16, config)
++        self.assertEqual(call_count[0], 1)
++        self.assertIs(result1, mock_instance)
++
++        # Second call with identical parameters - should return cached instance
++        result2 = test_factory(64, 64, 128, 10000.0, True, torch.float16, config)
++        self.assertEqual(call_count[0], 1)  # No additional call
++        self.assertIs(result2, mock_instance)
++        self.assertIs(result1, result2)
++
++    def test_cached_rope_factory_different_params_create_new_instances(self):
++        instance1 = Mock()
++        instance2 = Mock()
++        call_sequence = [instance1, instance2]
++        call_index = [0]
++
++        @cached_rope_factory
++        def test_factory(head_size, rotary_dim, max_position, base, is_neox_style, dtype, rope_config):
++            result = call_sequence[call_index[0]]
++            call_index[0] += 1
++            return result
++
++        config = RopeScaling(
++            rope_type="test",
++            rope_theta=10000.0,
++            original_max_position_embeddings=2048,
++            partial_rotary_factor=1.0
++        )
++
++        # First call
++        result1 = test_factory(64, 64, 128, 10000.0, True, torch.float16, config)
++        
++        # Second call with different head_size
++        result2 = test_factory(128, 64, 128, 10000.0, True, torch.float16, config)
++        
++        self.assertIsNot(result1, result2)
++        self.assertEqual(call_index[0], 2)  # Two factory calls
++
++    def test_cached_rope_factory_handles_rope_config_hashing(self):
++        mock_instance = Mock()
++        call_count = [0]
++
++        @cached_rope_factory
++        def test_factory(head_size, rotary_dim, max_position, base, is_neox_style, dtype, rope_config):
++            call_count[0] += 1
++            return mock_instance
++
++        # Create two configs with same values but different objects
++        config1 = RopeScaling(
++            rope_type="test",
++            rope_theta=10000.0,
++            original_max_position_embeddings=2048,
++            partial_rotary_factor=0.5,
++            factor=2.0
++        )
++        config2 = RopeScaling(
++            rope_type="test",
++            rope_theta=10000.0,
++            original_max_position_embeddings=2048,
++            partial_rotary_factor=0.5,
++            factor=2.0
++        )
++
++        # Should be treated as same key (hashable conversion works)
++        result1 = test_factory(64, 64, 128, 10000.0, True, torch.float16, config1)
++        result2 = test_factory(64, 64, 128, 10000.0, True, torch.float16, config2)
++        
++        self.assertEqual(call_count[0], 1)  # Only one factory call
++        self.assertIs(result1, result2)
++
++    def test_cached_rope_factory_passes_correct_args_to_default_factory(self):
++        mock_factory = Mock(return_value=Mock())
++        wrapped_factory = cached_rope_factory(mock_factory)
++
++        config = RopeScaling(
++            rope_type="default",
++            rope_theta=10000.0,
++            original_max_position_embeddings=2048,
++            partial_rotary_factor=1.0
++        )
++
++        wrapped_factory(64, 64, 128, 10000.0, True, torch.float16, config)
++        
++        # For 'default' type, should NOT pass rope_config
++        mock_factory.assert_called_once_with(
++            64, 64, 128, 10000.0, True, torch.float16
++        )
++
++    def test_cached_rope_factory_passes_correct_args_to_non_default_factory(self):
++        mock_factory = Mock(return_value=Mock())
++        wrapped_factory = cached_rope_factory(mock_factory)
++
++        config = RopeScaling(
++            rope_type="yarn",
++            rope_theta=10000.0,
++            original_max_position_embeddings=2048,
++            partial_rotary_factor=1.0,
++            factor=2.0
++        )
++
++        wrapped_factory(64, 64, 128, 10000.0, True, torch.float16, config)
++        
++        # For non-'default' types, should pass rope_config
++        mock_factory.assert_called_once_with(
++            64, 64, 128, 10000.0, True, torch.float16, config
++        )
++
++    def test_clear_rope_cache_removes_all_cached_instances(self):
++        mock_instance = Mock()
++
++        @cached_rope_factory
++        def test_factory(head_size, rotary_dim, max_position, base, is_neox_style, dtype, rope_config):
++            return mock_instance
++
++        config = RopeScaling(
++            rope_type="test",
++            rope_theta=10000.0,
++            original_max_position_embeddings=2048,
++            partial_rotary_factor=1.0
++        )
++
++        # Cache an instance
++        result1 = test_factory(64, 64, 128, 10000.0, True, torch.float16, config)
++        self.assertIn((64, 64, 128, True, tuple(asdict(config).items()), torch.float16), _ROPE_DICT)
++
++        # Clear cache
++        clear_rope_cache()
++        self.assertEqual(len(_ROPE_DICT), 0)
++
++        # Next call should create new instance (though we return same mock, cache was cleared)
++        result2 = test_factory(64, 64, 128, 10000.0, True, torch.float16, config)
++        self.assertIs(result1, result2)  # Same mock object, but cache was cleared and recreated
++
++    def test_get_rope_factory_returns_registered_factory(self):
++        mock_factory = Mock()
++        _ROPE_REGISTRY["test_type"] = mock_factory
++
++        result = get_rope_factory("test_type")
++        self.assertIs(result, mock_factory)
++
++    def test_get_rope_factory_returns_none_for_unregistered_type(self):
++        result = get_rope_factory("unregistered_type")
++        self.assertIsNone(result)
++
++
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file
+diff --git a/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_yarn_scaling_rope.py b/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_yarn_scaling_rope.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..52c0ec1b481583a1b6ea0c0e053ce15260396cfe
+--- /dev/null
++++ b/tests/pythontest/cpu/runtime/layers/embedding/rotary_embedding/test_yarn_scaling_rope.py
+@@ -0,0 +1,127 @@
++# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
++# MindIE is licensed under Mulan PSL v2.
++# You can use this software according to the terms and conditions of the Mulan PSL v2.
++# You may obtain a copy of Mulan PSL v2 at:
++#          http://license.coscl.org.cn/MulanPSL2
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
++# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
++# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
++# See the Mulan PSL v2 for more details.
++
++import unittest
++import torch
++from mindie_llm.runtime.layers.embedding.rotary_embedding.yarn_scaling_rope import (
++    YarnScalingRotaryEmbedding
++)
++from mindie_llm.runtime.layers.embedding.rotary_embedding.deepseek_v3_yarn_scaling_rope import (
++    DeepseekV3YarnRotaryEmbedding
++)
++
++
++class TestYarnScalingRotaryEmbedding(unittest.TestCase):
++
++    def setUp(self):
++        self.device = "cpu"
++        self.dtype = torch.float32
++
++    def test_yarn_scaling_rope_full_rotation(self):
++        rope = YarnScalingRotaryEmbedding(
++            head_size=64,
++            rotary_dim=64,
++            original_max_position_embeddings=2048,
++            base=10000.0,
++            is_neox_style=True,
++            dtype=self.dtype,
++            factor=2.0,
++            beta_fast=32,
++            beta_slow=1,
++            extrapolation_factor=1.0,
++            attention_factor=1.0,
++            apply_yarn_scaling=True,
++            truncate=True,
++            mscale=1.0
++        ).to(self.device)
++
++        # Check buffers exist
++        for name in ["inv_freq", "cos_cache", "sin_cache", "cos_sin_cache"]:
++            self.assertTrue(hasattr(rope, name))
++
++        # Check shapes
++        self.assertEqual(rope.inv_freq.shape, (32,))  # rotary_dim // 2
++        extended_len = int(2.0 * 2048)
++        self.assertEqual(rope.cos_cache.shape, (extended_len, 32))
++        self.assertEqual(rope.cos_sin_cache.shape, (extended_len, 64))
++
++        # Check device
++        self.assertEqual(rope.cos_cache.device.type, self.device)
++
++    def test_yarn_scaling_rope_partial_rotation(self):
++        rope = YarnScalingRotaryEmbedding(
++            head_size=128,
++            rotary_dim=64,  # partial
++            original_max_position_embeddings=1024,
++            base=10000.0,
++            is_neox_style=False,
++            dtype=torch.bfloat16,
++            factor=4.0,
++            beta_fast=16,
++            beta_slow=2,
++            mscale=1.2
++        ).to(self.device)
++
++        extended_len = int(4.0 * 1024)
++        self.assertEqual(rope.cos_cache.shape, (extended_len, 32))  # 64 // 2
++        self.assertEqual(rope.cos_sin_cache.shape, (extended_len, 64))
++        self.assertEqual(rope.cos_cache.dtype, torch.bfloat16)
++
++    def test_deepseek_v3_yarn_rope(self):
++        rope = DeepseekV3YarnRotaryEmbedding(
++            dim=128,
++            original_max_position_embeddings=4096,
++            base=10000.0,
++            factor=8.0,
++            beta_fast=64,
++            beta_slow=1,
++            is_neox_style=True,
++            dtype=torch.float16,
++            mscale=1.0,
++            mscale_all_dim=0.0
++        ).to(self.device)
++
++        # Deepseek uses rotary_dim = dim
++        extended_len = int(8.0 * 4096)
++        self.assertEqual(rope.cos_cache.shape, (extended_len, 64))  # 128 // 2
++        self.assertEqual(rope.cos_sin_cache.shape, (extended_len, 128))
++        self.assertEqual(rope.cos_cache.device.type, self.device)
++        self.assertEqual(rope.cos_cache.dtype, torch.float16)
++
++        # Buffers registered
++        for name in ["inv_freq", "cos_cache", "sin_cache", "cos_sin_cache"]:
++            self.assertTrue(hasattr(rope, name))
++
++    def test_buffers_are_non_persistent(self):
++        rope = YarnScalingRotaryEmbedding(
++            head_size=64,
++            rotary_dim=64,
++            original_max_position_embeddings=2048,
++            base=10000.0,
++            is_neox_style=True,
++            factor=2.0
++        )
++        state_dict = rope.state_dict()
++        for buf in ["inv_freq", "cos_cache", "sin_cache", "cos_sin_cache"]:
++            self.assertNotIn(buf, state_dict)
++
++    def test_deepseek_buffers_non_persistent(self):
++        rope = DeepseekV3YarnRotaryEmbedding(
++            dim=64,
++            original_max_position_embeddings=2048,
++            factor=2.0
++        )
++        state_dict = rope.state_dict()
++        for buf in ["inv_freq", "cos_cache", "sin_cache", "cos_sin_cache"]:
++            self.assertNotIn(buf, state_dict)
++
++
++if __name__ == '__main__':
++    unittest.main()
+\ No newline at end of file
+diff --git a/tests/pythontest/cpu/runtime/layers/embedding/test_position_rotary_embedding.py b/tests/pythontest/cpu/runtime/layers/embedding/test_position_rotary_embedding.py
+deleted file mode 100644
+index 55c86baf43698bc6ae7285c529c526b2141b1b1b..0000000000000000000000000000000000000000
+--- a/tests/pythontest/cpu/runtime/layers/embedding/test_position_rotary_embedding.py
++++ /dev/null
+@@ -1,216 +0,0 @@
+-# Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
+-# MindIE is licensed under Mulan PSL v2.
+-# You can use this software according to the terms and conditions of the Mulan PSL v2.
+-# You may obtain a copy of Mulan PSL v2 at:
+-#          http://license.coscl.org.cn/MulanPSL2
+-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+-# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+-# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+-# See the Mulan PSL v2 for more details.
+-
+-import math
+-import unittest
+-import torch
+-
+-from mindie_llm.runtime.layers.embedding.position_rotary_embedding import (
+-    PositionRotaryEmbedding,
+-    PositionEmbeddingType,
+-)
+-
+-
+-class TestPositionEmbeddingType(unittest.TestCase):
+-    """Test cases for PositionEmbeddingType enum."""
+-
+-    def test_enum_values(self):
+-        """Test enum values."""
+-        self.assertEqual(PositionEmbeddingType.ROPE, 0)
+-
+-
+-class TestPositionRotaryEmbedding(unittest.TestCase):
+-    """Test cases for PositionRotaryEmbedding."""
+-
+-    def setUp(self):
+-        """Set up test fixtures."""
+-        self.dim = 32
+-        self.base = 10000.0
+-        self.device = torch.device('cpu')
+-        self.scaling_factor = 1.0
+-        # Create inv_freq on CPU
+-        self.inv_freq = 1.0 / (
+-            self.base ** (torch.arange(0, self.dim, 2, device=self.device, dtype=torch.double) / self.dim)
+-        ).float()
+-        self.embedding = PositionRotaryEmbedding(
+-            self.inv_freq, self.scaling_factor, self.base
+-        )
+-
+-    def mock_configuration(self):
+-        mock_config = type('Config', (), {
+-                        'rope_theta': 10000.0,
+-                        'hidden_size': 128,
+-                        'num_attention_heads': 4,
+-                        'max_position_embeddings': 2048,
+-                        'rope_scaling': type('RopeScaling', (), {
+-                            'factor': 8.0,
+-                            'original_max_position_embeddings': None,
+-                            'beta_fast': 32.0,
+-                            'beta_slow': 1.0
+-                        })
+-                    })
+-        
+-        seqlen = 100
+-        device = self.device
+-        return mock_config, seqlen, device
+-
+-    def tearDown(self):
+-        """Clean up after tests."""
+-        pass
+-
+-    def test_init(self):
+-        """Test initialization."""
+-        self.assertEqual(self.embedding.base, self.base)
+-        self.assertTrue(torch.allclose(self.embedding.inv_freq, self.inv_freq))
+-        self.assertEqual(self.embedding.scaling_factor, self.scaling_factor)
+-        self.assertEqual(self.embedding._seq_len_cached, 0)
+-        self.assertIsNone(self.embedding._cos_cached)
+-        self.assertIsNone(self.embedding._sin_cached)
+-        self.assertIsNone(self.embedding._cos_cached_total)
+-        self.assertIsNone(self.embedding._sin_cached_total)
+-        self.assertIsNone(self.embedding._cos_k_cached)
+-        self.assertIsNone(self.embedding._sin_k_cached)
+-        self.assertEqual(self.embedding._ntk_alpha_cached, 1.0)
+-        self.assertEqual(self.embedding.position_ids_offset, [])
+-        self.assertEqual(self.embedding._table_size, 0)
+-
+-    def test_init_with_custom_scaling_factor(self):
+-        """Test initialization with custom scaling factor."""
+-        scaling_factor = 2.0
+-        embedding = PositionRotaryEmbedding(
+-            self.inv_freq, scaling_factor, self.base
+-        )
+-        self.assertEqual(embedding.scaling_factor, scaling_factor)
+-
+-    def test_init_with_custom_base(self):
+-        """Test initialization with custom base."""
+-        base = 5000.0
+-        embedding = PositionRotaryEmbedding(self.inv_freq, self.scaling_factor, base)
+-        self.assertEqual(embedding.base, base)
+-
+-    def test_static_method(self):
+-        """Test static method."""
+-        embed = PositionRotaryEmbedding.static(
+-            self.dim, self.base, self.device, self.scaling_factor
+-        )
+-        
+-        self.assertIsInstance(embed, PositionRotaryEmbedding)
+-        self.assertEqual(embed.base, self.base)
+-        self.assertEqual(embed.scaling_factor, self.scaling_factor)
+-        # Verify inv_freq is created on CPU
+-        self.assertEqual(embed.inv_freq.device, self.device)
+-
+-    def test_static_method_with_different_scaling_factor(self):
+-        """Test static method with different scaling factor."""
+-        scaling_factor = 2.0
+-        embed = PositionRotaryEmbedding.static(
+-            self.dim, self.base, self.device, scaling_factor
+-        )
+-        self.assertEqual(embed.scaling_factor, scaling_factor)
+-
+-    def test_static_method_with_different_base(self):
+-        """Test static method with different base."""
+-        base = 5000.0
+-        embed = PositionRotaryEmbedding.static(
+-            self.dim, base, self.device, self.scaling_factor
+-        )
+-        self.assertEqual(embed.base, base)
+-
+-    def test_update_cos_sin_cache_total_basic(self):
+-        """Test update_cos_sin_cache_total basic functionality."""
+-        seqlen = 10
+-        dtype = torch.float32
+-        
+-        self.embedding.update_cos_sin_cache_total(dtype, self.device, seqlen)
+-        
+-        self.assertEqual(self.embedding._seq_len_cached, seqlen)
+-        self.assertIsNotNone(self.embedding._cos_cached_total)
+-        self.assertIsNotNone(self.embedding._sin_cached_total)
+-        self.assertEqual(self.embedding._cos_cached_total.shape, (seqlen, self.dim))
+-        self.assertEqual(self.embedding._sin_cached_total.shape, (seqlen, self.dim))
+-        # Verify tensors are on CPU
+-        self.assertEqual(self.embedding._cos_cached_total.device, self.device)
+-        self.assertEqual(self.embedding._sin_cached_total.device, self.device)
+-
+-    def test_update_cos_sin_cache_total_scaling_factor_zero(self):
+-        """Test update_cos_sin_cache_total raises error when scaling_factor is 0."""
+-        self.embedding.scaling_factor = 0.0
+-        
+-        with self.assertRaises(ValueError) as context:
+-            self.embedding.update_cos_sin_cache_total(torch.float32, self.device, 10)
+-        
+-        self.assertIn("scaling_factor cannot be 0", str(context.exception))
+-
+-    def test_update_cos_sin_cache_total_cache_reuse(self):
+-        """Test update_cos_sin_cache_total reuses cache when conditions don't change."""
+-        seqlen = 10
+-        dtype = torch.float32
+-        
+-        self.embedding.update_cos_sin_cache_total(dtype, self.device, seqlen)
+-        cos_first = self.embedding._cos_cached_total.clone()
+-        sin_first = self.embedding._sin_cached_total.clone()
+-        
+-        # Call again with same seqlen - should reuse cache
+-        self.embedding.update_cos_sin_cache_total(dtype, self.device, seqlen)
+-        
+-        self.assertTrue(torch.allclose(self.embedding._cos_cached_total, cos_first))
+-        self.assertTrue(torch.allclose(self.embedding._sin_cached_total, sin_first))
+-
+-    def test_update_cos_sin_cache_total_increase_seqlen(self):
+-        """Test update_cos_sin_cache_total updates cache when seqlen increases."""
+-        dtype = torch.float32
+-        
+-        self.embedding.update_cos_sin_cache_total(dtype, self.device, 10)
+-        
+-        # Increase seqlen - should update cache
+-        self.embedding.update_cos_sin_cache_total(dtype, self.device, 20)
+-        
+-        self.assertEqual(self.embedding._seq_len_cached, 20)
+-        self.assertEqual(self.embedding._cos_cached_total.shape[0], 20)
+-
+-    def test_get_cos_cached_total(self):
+-        """Test get_cos_cached_total."""
+-        seqlen = 10
+-        dtype = torch.float32
+-        
+-        self.embedding.update_cos_sin_cache_total(dtype, self.device, seqlen)
+-        
+-        cos = self.embedding.get_cos_cached_total()
+-        
+-        self.assertIsNotNone(cos)
+-        self.assertTrue(torch.allclose(cos, self.embedding._cos_cached_total))
+-        self.assertEqual(cos.device, self.device)
+-
+-    def test_get_sin_cached_total(self):
+-        """Test get_sin_cached_total."""
+-        seqlen = 10
+-        dtype = torch.float32
+-        
+-        self.embedding.update_cos_sin_cache_total(dtype, self.device, seqlen)
+-        
+-        sin = self.embedding.get_sin_cached_total()
+-        
+-        self.assertIsNotNone(sin)
+-        self.assertTrue(torch.allclose(sin, self.embedding._sin_cached_total))
+-        self.assertEqual(sin.device, self.device)
+-
+-
+-    def test_update_cos_sin_cache_total_dtype_change(self):
+-        """Test update_cos_sin_cache_total updates cache when dtype changes."""
+-        self.embedding.update_cos_sin_cache_total(torch.float32, self.device, 10)
+-        
+-        # Change dtype - should update cache
+-        self.embedding.update_cos_sin_cache_total(torch.float16, self.device, 10)
+-        
+-        self.assertEqual(self.embedding._cos_cached_total.dtype, torch.float16)
+-        self.assertEqual(self.embedding._sin_cached_total.dtype, torch.float16)
+-
+-if __name__ == '__main__':
+-    unittest.main()
+diff --git a/tests/pythontest/cpu/runtime/models/deepseek_v3/test_deepseek_v3.py b/tests/pythontest/cpu/runtime/models/deepseek_v3/test_deepseek_v3.py
+index c89b180570b9f798f4ab9a7b94b820ef38a09e05..91a591a64b09f3f7fa45122bf21508fee7fc4a8b 100644
+--- a/tests/pythontest/cpu/runtime/models/deepseek_v3/test_deepseek_v3.py
++++ b/tests/pythontest/cpu/runtime/models/deepseek_v3/test_deepseek_v3.py
+@@ -3,8 +3,7 @@ from unittest.mock import patch, MagicMock
+ import torch
+ from torch import nn
+ from mindie_llm.runtime.models.deepseek_v3.deepseek_v3 import DeepseekV3Layer, DeepseekV3Model, \
+-    DeepseekV3Moe, DeepseekV3MLP, Indexer, DeepseekV3Attention, DeepseekV3ForCausalLM, \
+-    DeepseekV3YarnRotaryEmbedding, DeepseekV3RotaryEmbedding
++    DeepseekV3Moe, DeepseekV3MLP, Indexer, DeepseekV3Attention, DeepseekV3ForCausalLM
+ from mindie_llm.runtime.models.deepseek_v3.config_deepseek_v3 import DeepseekV3Config
+ from mindie_llm.runtime.utils.distributed import set_parallel_info_manager
+ from mindie_llm.runtime.layers.quantization.ms_model_slim.quantization_config import QuantizationConfig
+@@ -565,98 +564,5 @@ class TestDeepseekV3CausalLM(unittest.TestCase):
+         self.assertEqual(ds.softmax_scale, expect_scale)
+ 
+ 
+-class TestRotaryEmbeddings(unittest.TestCase):
+-    def setUp(self):
+-        self.dim = 64
+-        self.max_position_embeddings = 2048
+-        self.base = 10000
+-        self.device = "cpu"
+-        self.scaling_factor = 2.0
+-        self.original_max_position_embeddings = 4096
+-        self.beta_fast = 32
+-        self.beta_slow = 1
+-        self.mscale = 1.0
+-        self.mscale_all_dim = 0.0
+-
+-    def test_rope_initialization(self):
+-        rope = DeepseekV3RotaryEmbedding(
+-            self.dim, self.max_position_embeddings, self.base, self.device
+-        )
+-        self.assertEqual(rope.dim, self.dim)
+-        self.assertEqual(rope.base, self.base)
+-        self.assertEqual(rope.max_position_embeddings, self.max_position_embeddings)
+-        self.assertIsInstance(rope.inv_freq, torch.Tensor)
+-        self.assertEqual(rope.inv_freq.shape[0], self.dim // 2)
+-
+-    def test_yarn_rope_initialization(self):
+-        yarn_rope = DeepseekV3YarnRotaryEmbedding(
+-            self.dim,
+-            self.max_position_embeddings,
+-            self.base,
+-            self.device,
+-            scaling_factor=self.scaling_factor,
+-            original_max_position_embeddings=self.original_max_position_embeddings,
+-            beta_fast=self.beta_fast,
+-            beta_slow=self.beta_slow,
+-            mscale=self.mscale,
+-            mscale_all_dim=self.mscale_all_dim,
+-        )
+-        self.assertEqual(yarn_rope.scaling_factor, self.scaling_factor)
+-        self.assertEqual(yarn_rope.original_max_position_embeddings, self.original_max_position_embeddings)
+-        self.assertIsInstance(yarn_rope.inv_freq, torch.Tensor)
+-        self.assertEqual(yarn_rope.inv_freq.shape[0], self.dim // 2)
+-
+-    def test_set_cos_sin_cache(self):
+-        rope = DeepseekV3RotaryEmbedding(
+-            self.dim, self.max_position_embeddings, self.base, self.device
+-        )
+-        rope._set_cos_sin_cache(seq_len=128, device=rope.inv_freq.device, dtype=rope.inv_freq.dtype)
+-        self.assertEqual(rope.cos_cached.shape, (128, self.dim))
+-        self.assertEqual(rope.sin_cached.shape, (128, self.dim))
+-
+-    def test_forward(self):
+-        rope = DeepseekV3RotaryEmbedding(
+-            self.dim, self.max_position_embeddings, self.base, self.device
+-        )
+-        x = torch.randn(1, 4, 64)  # (batch, seq_len, dim)
+-        position_ids = torch.arange(0, 4).view(1, -1)
+-        kv_len = 4
+-        cos, sin = rope(x, position_ids, kv_len)
+-        self.assertEqual(cos.shape, (4, 1, 1, self.dim))
+-        self.assertEqual(sin.shape, (4, 1, 1, self.dim))
+-        self.assertTrue((cos.dtype == x.dtype) and (sin.dtype == x.dtype))
+-
+-    def test_yarn_forward(self):
+-        yarn_rope = DeepseekV3YarnRotaryEmbedding(
+-            self.dim,
+-            self.max_position_embeddings,
+-            self.base,
+-            self.device,
+-            scaling_factor=self.scaling_factor,
+-            original_max_position_embeddings=self.original_max_position_embeddings,
+-            beta_fast=self.beta_fast,
+-            beta_slow=self.beta_slow,
+-            mscale=self.mscale,
+-            mscale_all_dim=self.mscale_all_dim,
+-        )
+-        x = torch.randn(1, 4, 64)  # (batch, seq_len, dim)
+-        position_ids = torch.arange(0, 4).view(1, -1)
+-        kv_len = 4
+-        cos, sin = yarn_rope(x, position_ids, kv_len)
+-        self.assertEqual(cos.shape, (4, 1, 1, self.dim))
+-        self.assertEqual(sin.shape, (4, 1, 1, self.dim))
+-        self.assertTrue((cos.dtype == x.dtype) and (sin.dtype == x.dtype))
+-
+-    def test_resize_cache(self):
+-        rope = DeepseekV3RotaryEmbedding(
+-            self.dim, self.max_position_embeddings, self.base, self.device
+-        )
+-        rope(x=torch.randn(1, 8, self.dim), position_ids=torch.arange(0, 8).view(1, -1), kv_len=8)
+-        self.assertEqual(rope.max_seq_len_cached, 8)
+-
+-        rope(x=torch.randn(1, 16, self.dim), position_ids=torch.arange(0, 16).view(1, -1), kv_len=16)
+-        self.assertEqual(rope.max_seq_len_cached, 16)
+-
+-
+ if __name__ == '__main__':
+     unittest.main()
+\ No newline at end of file
