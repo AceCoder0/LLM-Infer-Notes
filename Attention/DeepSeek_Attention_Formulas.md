@@ -66,7 +66,7 @@ $$
 
 ## 1.5 吸收 (Absorbed / MQA) vs 非吸收 (Non-absorbed / MHA)
 
-### 5.1 本质区别
+### 1.5.1 本质区别
 
 | 模式 | 核心区别 | 缓存内容 |
 |------|----------|----------|
@@ -76,7 +76,7 @@ $$
 > MHA vs MQA 总览图
 > ![](../assets/mha-vs-mqa.png)
 
-### 5.2 公式等价性推导
+### 1.5.2 公式等价性推导
 
 #### 非吸收 (MHA) 版本的 Attention 计算
 
@@ -114,10 +114,14 @@ $$
 
 此时 **不再需要缓存每个头的 $k_{j,i}^C$**，只需缓存共享的 $c_j^{KV}$。每个头在做 Attention 时，用吸收后的 Query $\tilde{q}_{t,i}^C$ 直接与 $c_j^{KV}$ 做点积。
 
-同理，**把 $W_{UV}$ 从 Value 侧"吸收"到输出侧**：
+同理，**把 $W_{UV}$ 从 Value 侧"吸收"到输出侧**。设 $\alpha_{t,j} = \text{Softmax}_j$：
 
 $$
-o_{t,i} = \sum_{j} \alpha_{t,j} v_{j,i}^C = \sum_{j} \alpha_{t,j} (W_{UV}^{(i)} c_j^{KV}) = W_{UV}^{(i)} \left( \sum_{j} \alpha_{t,j} c_j^{KV} \right)
+\begin{aligned}
+o_{t,i} &= \sum_{j} \alpha_{t,j} \, v_{j,i}^C \\
+        &= \sum_{j} \alpha_{t,j} \, (W_{UV}^{(i)} c_j^{KV}) \\
+        &= W_{UV}^{(i)} \Big( \sum_{j} \alpha_{t,j} \, c_j^{KV} \Big)
+\end{aligned}
 $$
 
 令 $\tilde{o}_{t,i} = \sum_{j} \alpha_{t,j} c_j^{KV}$（维度为 $d_c$），则最终输出为：
@@ -131,7 +135,6 @@ $$
 #### 吸收后的计算流程
 
 吸收后，Attention 的计算变成（注意 $q_{t,i}^C$ 维度为 $d_h$，$\tilde{q}_{t,i}^C$ 维度为 $d_c$，Attention 中间输出维度为 $d_c$）：
-
 $$
 \begin{aligned}
 \tilde{q}_{t,i}^C &= W_{UK}^{(i)\top} \, q_{t,i}^C \\[4pt]
@@ -141,7 +144,7 @@ o_{t,i} &= W_{UV}^{(i)} \, \tilde{o}_{t,i}
 \end{aligned}
 $$
 
-### 5.3 计算图对比
+### 1.5.3 计算图对比
 
 ##### 非吸收的MLA（MHA版本）
 
