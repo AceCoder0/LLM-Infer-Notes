@@ -106,7 +106,7 @@ $$
 q_{t,i}^{C\top} k_{j,i}^C = q_{t,i}^{C\top} (W_{UK}^{(i)} c_j^{KV}) = (q_{t,i}^{C\top} W_{UK}^{(i)}) \cdot c_j^{KV}
 $$
 
-令 $\tilde{q}_{t,i}^C = W_{UK}^{(i)\top} q_{t,i}^C$（维度从 $d_h$ 降为 $d_c$），则：
+令 $\tilde{q}_{t,i}^C = W_{UK}^{(i)T} q_{t,i}^C$（维度从 $d_h$ 降为 $d_c$），则：
 
 $$
 q_{t,i}^{C\top} k_{j,i}^C = \tilde{q}_{t,i}^{C\top} c_j^{KV}
@@ -137,9 +137,9 @@ $$
 吸收后，Attention 的计算变成（注意 $q_{t,i}^C$ 维度为 $d_h$，$\tilde{q}_{t,i}^C$ 维度为 $d_c$，Attention 中间输出维度为 $d_c$）：
 $$
 \begin{aligned}
-\tilde{q}_{t,i}^C &= W_{UK}^{(i)\top} \, q_{t,i}^C \\[4pt]
-\text{score}_{t,j} &= \frac{\ \tilde{q}_{t,i}^{C\top} c_j^{KV} + q_{t,i}^{R\top} k_j^R\ }{\ \sqrt{d_h + d_h^R}\ } \\[4pt]
-\tilde{o}_{t,i} &= \sum_{j} \text{Softmax}_j(\text{score}_{t,j}) \cdot c_j^{KV} \\[4pt]
+\tilde{q}_{t,i}^C &= W_{UK}^{(i)T} \, q_{t,i}^C \\
+\text{score}_{t,j} &= \frac{\tilde{q}_{t,i}^{C\top} c_j^{KV} + q_{t,i}^{R\top} k_j^R}{\sqrt{d_h + d_h^R}} \\
+\tilde{o}_{t,i} &= \sum_{j} \text{Softmax}_j(\text{score}_{t,j}) \cdot c_j^{KV} \\
 o_{t,i} &= W_{UV}^{(i)} \, \tilde{o}_{t,i}
 \end{aligned}
 $$
