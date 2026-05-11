@@ -502,8 +502,8 @@ RoPE 施加在 window 的绝对位置 $w \cdot m'$，保证跨 forward call 拼�
 
 $$
 \boxed{
-C_w^{\text{Comp}} = \text{RoPE}\!\left(
-\text{RMSNorm}\!\left(
+C_w^{\text{Comp}} = \text{RoPE}\left(
+\text{RMSNorm}\left(
 \sum_{j=w m'}^{(w+1)m'-1} \frac{\exp(Z_j)}{\sum \exp(Z_k)} \odot C_j
 \right),\;
 \theta_{w \cdot m'}
@@ -537,7 +537,7 @@ $$
 
 $$
 \boxed{
-C_w^{\text{CSA}} = \underbrace{\sum_{j \in \text{win}_{w-1}} \frac{\exp(Z_j^a)}{\sum \exp(Z_k^a)} \odot C_j^a}_{\text{前窗口 Ca 贡献}} \;+\; \underbrace{\sum_{j \in \text{win}_{w}} \frac{\exp(Z_j^b)}{\sum \exp(Z_k^b)} \odot C_j^b}_{\text{当前窗口 Cb 贡献}}
+C_w^{\text{CSA}} = \underbrace{\sum_{j \in \text{win}_{w-1}} \frac{\exp(Z_j^a)}{\sum \exp(Z_k^a)} \odot C_j^a}_{\text{前窗口 Ca 贡献}} + \underbrace{\sum_{j \in \text{win}_{w}} \frac{\exp(Z_j^b)}{\sum \exp(Z_k^b)} \odot C_j^b}_{\text{当前窗口 Cb 贡献}}
 }
 $$
 
