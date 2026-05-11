@@ -130,28 +130,16 @@ $$
 
 #### 吸收后的计算流程
 
-吸收后，Attention 的计算变成：
+吸收后，Attention 的计算变成（注意 $q_{t,i}^C$ 维度为 $d_h$，$\tilde{q}_{t,i}^C$ 维度为 $d_c$，Attention 中间输出维度为 $d_c$）：
 
 $$
 \begin{aligned}
-\tilde{q}_{t,i}^C &= W_{UK}^{(i)\top} q_{t,i}^C & \quad & \text{(Q 吸收: 维度 } d_h \to d_c\text{)} \\
-\text{score}_{t,j} &= \frac{\tilde{q}_{t,i}^{C\top} c_j^{KV} + q_{t,i}^{R\top} k_j^R}{\sqrt{d_h + d_h^R}} & \quad & \text{(只用 } c_j^{KV}\text{ 和 } k_j^R\text{)} \\
-\tilde{o}_{t,i} &= \sum_{j} \text{Softmax}_j(\text{score}_{t,j}) \cdot c_j^{KV} & \quad & \text{(中间输出维度 } d_c\text{)} \\
-o_{t,i} &= W_{UV}^{(i)} \tilde{o}_{t,i} & \quad & \text{(V 解压缩)}
+\tilde{q}_{t,i}^C &= W_{UK}^{(i)\top} \, q_{t,i}^C \\[4pt]
+\text{score}_{t,j} &= \frac{\ \tilde{q}_{t,i}^{C\top} c_j^{KV} + q_{t,i}^{R\top} k_j^R\ }{\ \sqrt{d_h + d_h^R}\ } \\[4pt]
+\tilde{o}_{t,i} &= \sum_{j} \text{Softmax}_j(\text{score}_{t,j}) \cdot c_j^{KV} \\[4pt]
+o_{t,i} &= W_{UV}^{(i)} \, \tilde{o}_{t,i}
 \end{aligned}
 $$
-
-#### 为什么能节省显存？
-
-假设 $n_h = 128$，序列长度 $L = 32768$，$d_c = 512$，$d_h = 128$：
-
-| 缓存内容 | MHA (非吸收) | MQA (吸收) | 节省 |
-|---------|-------------|-----------|------|
-| Key Cache | $L \times n_h \times d_h = 128 \times 32768 \times 128$ | $L \times d_c = 32768 \times 512$ | **94%** |
-| Value Cache | $L \times n_h \times d_h = 128 \times 32768 \times 128$ | $L \times d_c = 32768 \times 512$ | **94%** |
-| RoPE Cache | $L \times d_h^R = 32768 \times 64$ | $L \times d_h^R = 32768 \times 64$ | 相同 |
-
-吸收版本只需要存 **512 维的 $c^{KV}$ + 64 维的 $k^R$**，而非吸收版本要存 **128 头 × 128 维 = 16384 维**的 Key 和 Value。
 
 ### 5.3 计算图对比
 
