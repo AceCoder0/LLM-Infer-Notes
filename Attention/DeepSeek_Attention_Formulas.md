@@ -66,10 +66,102 @@ $$
 
 ## 1.5 吸收 (Absorbed / MQA) vs 非吸收 (Non-absorbed / MHA)
 
+### 5.1 本质区别
+
 | 模式 | 核心区别 | 缓存内容 |
 |------|----------|----------|
 | **MHA (非吸收)** | 分别计算 $k_{t,i}, v_{t,i}$，按头存储 | 每头独立的 K/V cache |
 | **MQA (吸收)** | 将 $W_{UK}, W_{UV}$ 吸收进 Q/O，仅存 $c_t^{KV}$ | 仅存 $c_t^{KV}$ 和共享的 $k_t^R$ |
+
+> MHA vs MQA 总览图
+> ![](../assets/mha-vs-mqa.png)
+
+### 5.2 公式等价性推导
+
+#### 非吸收 (MHA) 版本的 Attention 计算
+
+在非吸收版本中，每个头 $i$ 都有独立的内容 Key 和 Value：
+
+$$
+k_{j,i}^C = W_{UK}^{(i)} c_j^{KV}, \quad v_{j,i}^C = W_{UV}^{(i)} c_j^{KV}
+$$
+
+其中 $W_{UK}^{(i)}$ 和 $W_{UV}^{(i)}$ 表示第 $i$ 个头的解压缩矩阵（从 $d_c$ 维映射到 $d_h$ 维）。单头 Attention 输出为：
+
+$$
+o_{t,i} = \sum_{j} \text{Softmax}_j \left( \frac{q_{t,i}^\top k_{j,i}}{\sqrt{d_h + d_h^R}} \right) v_{j,i}^C
+$$
+
+将 Key 拆开为内容部分和 RoPE 部分：
+
+$$
+q_{t,i}^\top k_{j,i} = q_{t,i}^{C\top} k_{j,i}^C + q_{t,i}^{R\top} k_j^R
+$$
+
+#### 吸收 (MQA) 版本的推导
+
+利用矩阵乘法结合律，**把 $W_{UK}$ 从 Key 侧"吸收"到 Query 侧**：
+
+$$
+q_{t,i}^{C\top} k_{j,i}^C = q_{t,i}^{C\top} (W_{UK}^{(i)} c_j^{KV}) = (q_{t,i}^{C\top} W_{UK}^{(i)}) \cdot c_j^{KV}
+$$
+
+令 $\tilde{q}_{t,i}^C = W_{UK}^{(i)\top} q_{t,i}^C$（维度从 $d_h$ 降为 $d_c$），则：
+
+$$
+q_{t,i}^{C\top} k_{j,i}^C = \tilde{q}_{t,i}^{C\top} c_j^{KV}
+$$
+
+此时 **不再需要缓存每个头的 $k_{j,i}^C$**，只需缓存共享的 $c_j^{KV}$。每个头在做 Attention 时，用吸收后的 Query $\tilde{q}_{t,i}^C$ 直接与 $c_j^{KV}$ 做点积。
+
+同理，**把 $W_{UV}$ 从 Value 侧"吸收"到输出侧**：
+
+$$
+o_{t,i} = \sum_{j} \alpha_{t,j} v_{j,i}^C = \sum_{j} \alpha_{t,j} (W_{UV}^{(i)} c_j^{KV}) = W_{UV}^{(i)} \left( \sum_{j} \alpha_{t,j} c_j^{KV} \right)
+$$
+
+令 $\tilde{o}_{t,i} = \sum_{j} \alpha_{t,j} c_j^{KV}$（维度为 $d_c$），则最终输出为：
+
+$$
+u_t = W_O [W_{UV}^{(1)} \tilde{o}_{t,1}; \dots; W_{UV}^{(n_h)} \tilde{o}_{t,n_h}]
+$$
+
+或者等价地，可以把 $W_{UV}$ 也合并进 $W_O$，一步从 $d_c$ 投影到 $d$。
+
+#### 吸收后的计算流程
+
+吸收后，Attention 的计算变成：
+
+$$
+\begin{aligned}
+\tilde{q}_{t,i}^C &= W_{UK}^{(i)\top} q_{t,i}^C & \quad & \text{(Q 吸收: 维度 } d_h \to d_c\text{)} \\
+\text{score}_{t,j} &= \frac{\tilde{q}_{t,i}^{C\top} c_j^{KV} + q_{t,i}^{R\top} k_j^R}{\sqrt{d_h + d_h^R}} & \quad & \text{(只用 } c_j^{KV}\text{ 和 } k_j^R\text{)} \\
+\tilde{o}_{t,i} &= \sum_{j} \text{Softmax}_j(\text{score}_{t,j}) \cdot c_j^{KV} & \quad & \text{(中间输出维度 } d_c\text{)} \\
+o_{t,i} &= W_{UV}^{(i)} \tilde{o}_{t,i} & \quad & \text{(V 解压缩)}
+\end{aligned}
+$$
+
+#### 为什么能节省显存？
+
+假设 $n_h = 128$，序列长度 $L = 32768$，$d_c = 512$，$d_h = 128$：
+
+| 缓存内容 | MHA (非吸收) | MQA (吸收) | 节省 |
+|---------|-------------|-----------|------|
+| Key Cache | $L \times n_h \times d_h = 128 \times 32768 \times 128$ | $L \times d_c = 32768 \times 512$ | **94%** |
+| Value Cache | $L \times n_h \times d_h = 128 \times 32768 \times 128$ | $L \times d_c = 32768 \times 512$ | **94%** |
+| RoPE Cache | $L \times d_h^R = 32768 \times 64$ | $L \times d_h^R = 32768 \times 64$ | 相同 |
+
+吸收版本只需要存 **512 维的 $c^{KV}$ + 64 维的 $k^R$**，而非吸收版本要存 **128 头 × 128 维 = 16384 维**的 Key 和 Value。
+
+### 5.3 计算图对比
+
+##### 非吸收的MLA（MHA版本）
+
+![](../assets/sfa-mha.png)
+
+##### 吸收的MLA（MQA版本）
+
+![](../assets/sfa-mqa.png)
 
 ---
 
