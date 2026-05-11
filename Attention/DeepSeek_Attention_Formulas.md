@@ -455,14 +455,121 @@ $$
 
 ### 压缩 KV (CSA / HCA)
 
-压缩器将滑动窗口外的历史 token 聚合成少量压缩条目 $C^{\text{Comp}}$：
+V4 在不同 layer 使用不同压缩策略，形成"局部滑动窗口 + 全局压缩"的分层注意力。压缩后的 KV 与滑动窗口 KV 沿序列维度拼接：
 
 $$
-\begin{aligned}
-\text{compressed-kv} &= \text{Compressor}(h_t, c_t^Q, \dots) \\
-k_t^{\text{total}} &= \big[\, k_t^{\text{sliding}}; \text{compressed-kv} \,\big] \quad \text{(拼接滑动窗口 + 压缩条目)}
-\end{aligned}
+k_t^{\text{total}} = \big[\, k_t^{\text{sliding}}; k_t^{\text{comp}} \,\big]
 $$
+
+两种压缩器的核心差别：**C128 (HCA)** 在每 128 token 内做一次 dense 聚合，适合"粗粒度长程依赖"；**C4 (CSA)** 在每 4 token 内做一次压缩，额外配上 Indexer 做 Top-K 稀疏选择，适合"细粒度稀疏长程"。两种压缩器底层算子相同——都是 **softmax-gated aggregation**。
+
+---
+
+#### 3.1.1 HCA（Heavily Compressed Attention，C128）
+
+每 $m' = 128$ 个 token 压缩为 1 个 compressed KV entry。窗口无重叠，稠密全量压缩。
+
+**Step 1 — KV 投影 + Gate 投影：**
+
+对输入 $h_j \in \mathbb{R}^{d}$：
+
+$$
+C_j = W_{\text{kv}}^{\text{comp}} \cdot h_j \quad\in \mathbb{R}^{d_h},\qquad
+Z_j = W_{\text{gate}}^{\text{comp}} \cdot h_j + b^{\text{pos}}_j \quad\in \mathbb{R}^{d_h}
+$$
+
+其中 $b^{\text{pos}}_j$ 是 `position_bias`（shape $m' \times d_h$），给 window 内每个相对位置提供可学习偏置。
+
+**Step 2 — Softmax-gated 聚合（窗口长度 $m'$）：**
+
+对第 $w$ 个窗口：
+
+$$
+C_w^{\text{Comp}} = \sum_{j = w m'}^{(w+1)m'-1} \underbrace{\frac{\exp(Z_j)}{\sum_{k=w m'}^{(w+1)m'-1} \exp(Z_k)}}_{\text{Softmax}(Z_j)} \;\odot\; C_j
+$$
+
+即每个位置通过可学习的 gate $Z_j$ 决定在压缩条目中的贡献权重。
+
+**Step 3 — RMSNorm + RoPE：**
+
+$$
+C_w^{\text{Comp}} \leftarrow \text{RoPE}\!\left(\text{RMSNorm}(C_w^{\text{Comp}}),\; \theta_{w \cdot m'}\right)
+$$
+
+RoPE 施加在 window 的绝对位置 $w \cdot m'$，保证跨 forward call 拼接时因果关系正确。
+
+**HCA 完整公式（一步到位）：**
+
+$$
+\boxed{
+C_w^{\text{Comp}} = \text{RoPE}\!\left(
+\text{RMSNorm}\!\left(
+\sum_{j=w m'}^{(w+1)m'-1} \frac{\exp(Z_j)}{\sum \exp(Z_k)} \odot C_j
+\right),\;
+\theta_{w \cdot m'}
+\right)
+}
+$$
+
+---
+
+#### 3.1.2 CSA（Compressed Sparse Attention，C4）
+
+每 $m = 4$ 个 token 压缩一次，采用**跨窗口重叠**（有效感受野 $2m$，stride $m$）。额外配 **Lightning Indexer** 做 Top-K 稀疏选择。
+
+**Ca / Cb 双序列投影：**
+
+投影到 $2 d_h$ 维度，拆为两个独立序列：
+
+$$
+C_j^a = W_{\text{kv}}^{\text{comp}}[\,{:}d_h] \cdot h_j,\qquad
+C_j^b = W_{\text{kv}}^{\text{comp}}[d_h{:}\,] \cdot h_j
+$$
+
+$$
+Z_j^a = W_{\text{gate}}^{\text{comp}}[\,{:}d_h] \cdot h_j + b^{\text{pos},a}_j,\qquad
+Z_j^b = W_{\text{gate}}^{\text{comp}}[d_h{:}\,] \cdot h_j + b^{\text{pos},b}_j
+$$
+
+**跨窗口 Softmax-gated 组合：**
+
+窗口 $w$ 的压缩条目由 window_{w-1} 的 Ca 和 window_w 的 Cb 共同决定（有效宽度 $2m$）：
+
+$$
+\boxed{
+C_w^{\text{CSA}} = \underbrace{\sum_{j \in \text{win}_{w-1}} \frac{\exp(Z_j^a)}{\sum \exp(Z_k^a)} \odot C_j^a}_{\text{前窗口 Ca 贡献}} \;+\; \underbrace{\sum_{j \in \text{win}_{w}} \frac{\exp(Z_j^b)}{\sum \exp(Z_k^b)} \odot C_j^b}_{\text{当前窗口 Cb 贡献}}
+}
+$$
+
+同样接 RMSNorm + RoPE（与 HCA 一致）。
+
+**Lightning Indexer 稀疏选择：**
+
+Indexer 维护一份**小维度**压缩 KV（`index_head_dim` $\ll d_h$），结构与 CSA 压缩器相同（Ca/Cb 重叠）。对每个 query token 计算 Top-K：
+
+1. 小维度 Q 投影：$q_{t,h}^{\text{Idx}} = W_{\text{qb}}^{\text{Idx}} \cdot c_t^Q$
+2. ReLU 激活的点积得分：$\text{score}_{t,h,s} = \text{ReLU}\!\left(q_{t,h}^{\text{Idx}} \cdot K_s^{\text{Idx}} / \sqrt{d_{\text{Idx}}}\right)$
+3. 学到的 head weights 聚合：$\text{score}_{t,s} = \sum_h w_{t,h} \cdot \text{score}_{t,h,s}$
+4. Top-K 选择：$\mathcal{K}_t = \text{TopK}_k(\{\text{score}_{t,s}\})$
+
+最终只有 $\mathcal{K}_t$ 中的 compressed KV entries 参与 attention：
+
+$$
+k_t^{\text{total}} = \big[\, k_t^{\text{sliding}}; \{C_s^{\text{CSA}}\}_{s \in \mathcal{K}_t} \,\big]
+$$
+
+---
+
+#### C4 vs C128 对比
+
+| 属性 | HCA (C128) | CSA (C4) |
+|------|-----------|----------|
+| 压缩率 | $m' = 128$ | $m = 4$ |
+| 窗口重叠 | 无 (stride=m') | 有 (有效宽 $2m$, stride=$m$) |
+| 选择方式 | 稠密全量（所有压缩条目都参与 attention） | Top-K 稀疏（Indexer 挑选 $k$ 个） |
+| 精度 | 粗粒度：适合远距离、低频依赖 | 细粒度：适合中距离、需要精确选择的依赖 |
+| 压缩比 | ~128:1 | ~4:1（但 Top-K 进一步 reduce） |
+| 额外模块 | 无 | Lightning Indexer（额外小维度压缩 KV） |
 
 ### Attention + Sink
 
@@ -575,7 +682,142 @@ class DeepseekV4Attention(nn.Module):
         return output, attn_weights
 ```
 
-> 注：V4 的 `Compressor` 模块（CSA / HCA）实现较为复杂，涉及窗口缓冲、重叠状态、softmax-gated 聚合等，本文档不展开其内部公式，详细实现请参考 `transformers` 源码中的 `DeepseekV4CSACache`、`DeepseekV4HCACache` 与对应的 `Compressor` 类。
+## 3.3 参考代码：Compressor (HCA / CSA)
+
+以下代码展示两种压缩器的核心计算路径，去除了 Cache 缓冲、窗口补齐等工程细节。
+
+### HCA Compressor (C128)
+
+```python
+class DeepseekV4HCACompressor(nn.Module):
+    """每 m'=128 token 压缩为 1 个 dense compressed KV entry。"""
+    def __init__(self, config):
+        self.compress_rate = config.compress_rates["heavily_compressed_attention"]  # 128
+        self.head_dim = config.head_dim
+        self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.position_bias = nn.Parameter(torch.empty(self.compress_rate, self.head_dim))
+        self.kv_norm = DeepseekV4RMSNorm(self.head_dim)
+        self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+
+    def forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx):
+        kv = self.kv_proj(hidden_states)       # (B, S, d_h)
+        gate = self.gate_proj(hidden_states)    # (B, S, d_h)
+
+        # 截取完整窗口
+        usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
+        kv, gate = kv[:, :usable], gate[:, :usable]
+
+        # 分窗: (B, n_win, m', d_h)
+        n_win = kv.shape[1] // self.compress_rate
+        kv = kv.view(-1, n_win, self.compress_rate, self.head_dim)
+        gate = gate.view(-1, n_win, self.compress_rate, self.head_dim) + self.position_bias
+
+        # Softmax-gated 聚合: C_w = Σ_j softmax(Z_j + B_j) ⊙ C_j
+        compressed = (kv * gate.softmax(dim=2)).sum(dim=2)
+        compressed = self.kv_norm(compressed)   # RMSNorm
+
+        # RoPE at window absolute position
+        positions = torch.arange(n_win) * self.compress_rate
+        cos, sin = self.rotary_emb(compressed, position_ids=positions)
+        compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+        return compressed.unsqueeze(1)  # (B, 1, n_win, d_h)
+```
+
+### CSA Compressor (C4)
+
+```python
+class DeepseekV4CSACompressor(nn.Module):
+    """每 m=4 token 压缩一次，跨窗口 Ca/Cb 重叠 + Lightning Indexer Top-K 稀疏选择。"""
+    def __init__(self, config):
+        self.compress_rate = config.compress_rates["compressed_sparse_attention"]  # 4
+        self.head_dim = config.head_dim
+        # 投影到 2*d_h: 前半 Ca (给下一窗口), 后半 Cb (给当前窗口)
+        self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
+        self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
+        self.kv_norm = DeepseekV4RMSNorm(self.head_dim)
+        self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+        self.indexer = DeepseekV4Indexer(config)
+
+    def forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx):
+        kv = self.kv_proj(hidden_states)       # (B, S, 2*d_h)
+        gate = self.gate_proj(hidden_states)    # (B, S, 2*d_h)
+
+        usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
+        kv, gate = kv[:, :usable], gate[:, :usable]
+
+        n_win = kv.shape[1] // self.compress_rate
+        kv = kv.view(-1, n_win, self.compress_rate, 2 * self.head_dim)
+        gate = gate.view(-1, n_win, self.compress_rate, 2 * self.head_dim) + self.position_bias
+
+        # 跨窗口布局: [Ca_{w-1}, Cb_w], 宽 2*m, stride m
+        # ratio=m, Ca=[:head_dim] in first half, Cb=[head_dim:] in second half
+        new_kv = kv.new_zeros(-1, n_win, 2 * self.compress_rate, self.head_dim)
+        new_gate = gate.new_full((-1, n_win, 2 * self.compress_rate, self.head_dim), float("-inf"))
+
+        new_kv[:, :, self.compress_rate:] = kv[..., self.head_dim:]      # Cb_w 放后半
+        new_gate[:, :, self.compress_rate:] = gate[..., self.head_dim:]  # Zb_w 放后半
+        if n_win > 1:
+            new_kv[:, 1:, :self.compress_rate] = kv[:, :-1, :, :self.head_dim]   # Ca_{w-1} 放前半
+            new_gate[:, 1:, :self.compress_rate] = gate[:, :-1, :, :self.head_dim]
+
+        # Softmax-gated 聚合 on 2*m width
+        compressed = (new_kv * new_gate.softmax(dim=2)).sum(dim=2)
+        compressed = self.kv_norm(compressed)  # (B, n_win, d_h)
+
+        # RoPE
+        positions = torch.arange(n_win) * self.compress_rate
+        cos, sin = self.rotary_emb(compressed, position_ids=positions)
+        compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+        compressed_kv = compressed.unsqueeze(1)  # (B, 1, n_win, d_h)
+
+        # Lightning Indexer: Top-K sparse selection
+        topk_idx = self.indexer(hidden_states, q_residual, position_ids,
+                                past_key_values, layer_idx)  # (B, S, k)
+        # gather the selected compressed entries per query
+        expanded = compressed_kv.unsqueeze(2).expand(-1, -1, hidden_states.shape[1], -1, -1)
+        idx = topk_idx.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, self.head_dim)
+        return torch.gather(expanded, 3, idx).reshape(-1, 1, hidden_states.shape[1] * config.index_topk, self.head_dim)
+```
+
+### Lightning Indexer
+
+```python
+class DeepseekV4Indexer(nn.Module):
+    """小维度压缩 KV + ReLU(q·k) * head_weights → Top-K 索引。"""
+    def __init__(self, config):
+        self.compress_rate = config.compress_rates["compressed_sparse_attention"]  # 4
+        self.num_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim       # << d_h (e.g. 128 vs 512)
+        self.index_topk = config.index_topk          # k, e.g. 2048
+        self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
+        self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
+        self.kv_norm = DeepseekV4RMSNorm(self.head_dim)
+        self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
+        self.rotary_emb = DeepseekV4RotaryEmbedding(config)
+
+    def forward(self, hidden_states, q_residual, position_ids, past_key_values, layer_idx):
+        # --- 与 CSA Compressor 相同结构, 在 index_head_dim 维度 ---
+        kv = self.kv_proj(hidden_states)
+        gate = self.gate_proj(hidden_states)
+        # ... 相同的 Ca/Cb 窗口布局、softmax-gated 聚合、RMSNorm ...
+        compressed_kv = ...  # (B, T_comp, index_head_dim), 经过 RoPE
+
+        # Q 投影到 index 空间
+        q = self.q_b_proj(q_residual).view(-1, seq_len, self.num_heads, self.head_dim)
+        q = apply_rotary_pos_emb(q, cos_q, sin_q)  # query 位置的 RoPE
+
+        # ReLU(q · K^T) * weights → Top-K
+        scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float())  # (B, S, H, T)
+        scores = F.relu(scores) * (self.head_dim ** -0.5)
+        weights = self.weights_proj(hidden_states).float() * (self.num_heads ** -0.5)
+        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)  # (B, S, T)
+
+        return index_scores.topk(min(self.index_topk, index_scores.shape[-1]), dim=-1)[1]
+```
 
 ---
 
