@@ -511,6 +511,31 @@ C_w^{\text{Comp}} = \text{RoPE}\left(
 }
 $$
 
+**具体例子（S=256 token 输入，m'=128）：**
+
+```
+输入 256 个 token，分窗 reshape：
+  hidden_states (1, 256, 5120)
+      │
+      ├── C = W_kv_comp · h     (1, 256, 512)
+      ├── Z = W_gate_comp · h   (1, 256, 512)
+      │
+      └── 截整 + 分窗:
+          C.view(1, 2, 128, 512)     ← 2 个窗口，每个 128 token
+          Z.view(1, 2, 128, 512) + position_bias(128, 512)
+
+窗口布局:
+  窗口 0: token 0..127    ──softmax(Z) gate──▶  C₀^comp  (1, 512)
+  窗口 1: token 128..255  ──softmax(Z) gate──▶  C₁^comp  (1, 512)
+
+聚合操作:
+  C₀^comp = Σ_{j=0}^{127} softmax(Z_j) ⊙ C_j    ← 128→1 压缩!
+  C₁^comp = Σ_{j=128}^{255} softmax(Z_j) ⊙ C_j
+
+结果 (1, 2, 512)，256 token → 2 个 compressed entries。
+经 RMSNorm + RoPE(pos=0, 128) 后拼入历史 compressed KV。
+```
+
 ---
 
 #### 3.1.2 CSA（Compressed Sparse Attention，C4）
@@ -576,6 +601,51 @@ $$
 $$
 k_t^{\text{total}} = \big[\, k_t^{\text{sliding}}; \{C_s^{\text{CSA}}\}_{s \in \mathcal{K}_t} \,\big]
 $$
+
+---
+
+**具体例子（S=12 token，m=4，Ca/Cb 跨窗口重叠）：**
+
+```
+Step 1: kv_proj 输出 2*d_h，切两半
+  kv = self.kv_proj(h)         (1, 12, 2*d_h)
+  Ca = kv[:, :, :d_h]          (1, 12, 512)  ← 贡献给"下一窗口"
+  Cb = kv[:, :, d_h:]          (1, 12, 512)  ← 贡献给"当前窗口"
+
+Step 2: 分窗 (12 token → 3 窗口)
+  chunk_kv.view(1, 3, 4, 2*d_h)
+
+  窗口 0: token 0..3   → Ca0(4,512) + Cb0(4,512)
+  窗口 1: token 4..7   → Ca1(4,512) + Cb1(4,512)
+  窗口 2: token 8..11  → Ca2(4,512) + Cb2(4,512)
+
+Step 3: 跨窗口拼接到 new_kv(1, 3, 8, 512), 8 = 2*m
+  先填 Cb 到 slot 4..7:
+    窗口 0:  [_, _, _, _, Cb0,0, Cb0,1, Cb0,2, Cb0,3]
+    窗口 1:  [_, _, _, _, Cb1,0, Cb1,1, Cb1,2, Cb1,3]
+    窗口 2:  [_, _, _, _, Cb2,0, Cb2,1, Cb2,2, Cb2,3]
+
+  再把窗口 w-1 的 Ca 搬到窗口 w 的 slot 0..3:
+    窗口 0:  [上次Ca_prev,  Cb0]  ← 从 cache 拿上一轮最后窗口的 Ca
+    窗口 1:  [Ca0,         Cb1]  ← 窗口0的Ca 搬到 窗口1的前半
+    窗口 2:  [Ca1,         Cb2]  ← 窗口1的Ca 搬到 窗口2的前半
+
+Step 4: 8个slot做 softmax 竞争, 压缩为 1 个 entry/窗口
+  C₁^comp = Σ_{j=0..3} softmax(Za0,j) ⊙ Ca0,j      ← 前窗 Ca
+          + Σ_{j=0..3} softmax(Zb1,j) ⊙ Cb1,j      ← 当前 Cb
+
+直观结构:
+  Token:   0   1   2   3 | 4   5   6   7 | 8   9  10  11
+           ├── win0 ──┤  ├── win1 ──┤  ├── win2 ──┤
+                │               │               │
+           Ca0:──────┐   Ca1:──────┐   Ca2: → cache (下次用)
+           Cb0:──┐   │   Cb1:──┐   │   Cb2:──┐
+                 │   │         │   │         │
+                 ▼   ▼         ▼   ▼         ▼
+              C₀^comp       C₁^comp       C₂^comp
+            (上次Ca+Cb0)    (Ca0+Cb1)    (Ca1+Cb2)
+            有效宽=2m=8, stride=m=4
+```
 
 ---
 
