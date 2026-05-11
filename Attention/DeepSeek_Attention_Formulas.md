@@ -485,7 +485,7 @@ $$
 对第 $w$ 个窗口：
 
 $$
-C_w^{\text{Comp}} = \sum_{j = w m'}^{(w+1)m'-1} \underbrace{\frac{\exp(Z_j)}{\sum_{k=w m'}^{(w+1)m'-1} \exp(Z_k)}}_{\text{Softmax}(Z_j)} \;\odot\; C_j
+C_w^{\text{Comp}} = \sum_{j = w m'}^{(w+1)m'-1} \underbrace{\frac{\exp(Z_j)}{\sum_{k=w m'}^{(w+1)m'-1} \exp(Z_k)}}_{\text{Softmax}(Z_j)} \odot C_j
 $$
 
 即每个位置通过可学习的 gate $Z_j$ 决定在压缩条目中的贡献权重。
@@ -493,7 +493,7 @@ $$
 **Step 3 — RMSNorm + RoPE：**
 
 $$
-C_w^{\text{Comp}} \leftarrow \text{RoPE}\!\left(\text{RMSNorm}(C_w^{\text{Comp}}),\; \theta_{w \cdot m'}\right)
+C_w^{\text{Comp}} \leftarrow \text{RoPE}\left(\text{RMSNorm}(C_w^{\text{Comp}}),\; \theta_{w \cdot m'}\right)
 $$
 
 RoPE 施加在 window 的绝对位置 $w \cdot m'$，保证跨 forward call 拼接时因果关系正确。
@@ -547,10 +547,29 @@ $$
 
 Indexer 维护一份**小维度**压缩 KV（`index_head_dim` $\ll d_h$），结构与 CSA 压缩器相同（Ca/Cb 重叠）。对每个 query token 计算 Top-K：
 
-1. 小维度 Q 投影：$q_{t,h}^{\text{Idx}} = W_{\text{qb}}^{\text{Idx}} \cdot c_t^Q$
-2. ReLU 激活的点积得分：$\text{score}_{t,h,s} = \text{ReLU}\!\left(q_{t,h}^{\text{Idx}} \cdot K_s^{\text{Idx}} / \sqrt{d_{\text{Idx}}}\right)$
-3. 学到的 head weights 聚合：$\text{score}_{t,s} = \sum_h w_{t,h} \cdot \text{score}_{t,h,s}$
-4. Top-K 选择：$\mathcal{K}_t = \text{TopK}_k(\{\text{score}_{t,s}\})$
+1. **小维度 Q 投影：**
+
+$$
+q_{t,h}^{\text{Idx}} = W_{\text{qb}}^{\text{Idx}} \cdot c_t^Q
+$$
+
+2. **ReLU 激活的点积得分：**
+
+$$
+\text{score}_{t,h,s} = \text{ReLU}\!\left(q_{t,h}^{\text{Idx}} \cdot K_s^{\text{Idx}} \;\middle/\; \sqrt{d_{\text{Idx}}}\right)
+$$
+
+3. **学到的 head weights 聚合：**
+
+$$
+\text{score}_{t,s} = \sum_{h} w_{t,h} \cdot \text{score}_{t,h,s}
+$$
+
+4. **Top-K 选择：**
+
+$$
+\mathcal{K}_t = \text{TopK}_k\big(\{\text{score}_{t,s}\}\big)
+$$
 
 最终只有 $\mathcal{K}_t$ 中的 compressed KV entries 参与 attention：
 
